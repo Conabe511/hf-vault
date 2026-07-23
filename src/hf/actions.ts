@@ -150,4 +150,10 @@ export class HFDataManager {
     getFile(id: string) {
         return this.load().files.find(x => x.id === id);
     }
+
+    removeFile(id: string) {
+        const collection = this.load();
+        collection.files = collection.files.filter(x => x.id !== id);
+        this.save();
+    }
 }

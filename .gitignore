@@ -4,3 +4,5 @@ node_modules/
 
 *.hfcoll
 *.hfkey
+
+.DS_Store

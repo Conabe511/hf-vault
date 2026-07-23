@@ -1,5 +1,5 @@
-import { intro, isCancel, cancel, note, spinner, path, log, confirm } from "@clack/prompts";
-import { repoExists, uploadFilesWithProgress } from "@huggingface/hub";
+import { intro, isCancel, cancel, note, spinner, path, log, confirm, progress } from "@clack/prompts";
+import { commitIter, repoExists } from "@huggingface/hub";
 import { randomBytes } from "crypto";
 import { statSync, unlinkSync } from "fs";
 import { pathToFileURL } from "url";
@@ -7,9 +7,12 @@ import { inspectFile, createHFRepo, HFDataManager } from "../../hf/actions";
 import { formatBytes, logHFError, mimeFromExtension } from "../../utils/utils";
 import { Encoder } from "../../cryptography/encoder";
 import { KeyVault } from "../../cryptography/key-vault";
+import { progressFetch } from "../../hf/progress-fetch";
 import { ensureVaultOpen } from "../utils/vault-access";
+import { clearScreen } from "../utils/screen";
 
 export async function handleUploadProcess() {
+    clearScreen();
     intro("Upload File");
 
     // Single path prompt — removed the duplicate text() call
@@ -74,23 +77,53 @@ export async function handleUploadProcess() {
 
     const totalBytes = statSync(outputName).size;
 
-    const uploadSpinner = spinner();
-    uploadSpinner.start("Uploading...");
+    const uploadProgress = progress({ max: 100 });
+    uploadProgress.start("Preparing upload...");
+
+    // The generator reports fileProgress 0->1 TWICE per file: once while
+    // hashing, once while uploading. Fed straight into one bar that looks
+    // like the bar filling up and snapping back — so both passes are mapped
+    // onto a single 0-100 scale instead. advance() can't go backwards,
+    // hence the monotonic "position" tracking.
+    let position = 0;
+    const advanceTo = (target: number, message: string) => {
+        const delta = Math.min(Math.floor(target), 100) - position;
+        uploadProgress.advance(Math.max(delta, 0), message);
+        position += Math.max(delta, 0);
+    };
 
     try {
         // Drain the generator fully — the upload only completes once all events are consumed
-        for await (const _ of uploadFilesWithProgress({
+        // commitIter instead of uploadFilesWithProgress: same event stream,
+        // but it accepts a custom fetch. The wrapper's own progress reporting
+        // needs XMLHttpRequest (browser-only), so in Node it goes silent
+        // during the transfer — progressFetch fills exactly that gap.
+        for await (const event of commitIter({
             repo: process.env.HF_REPO,
             accessToken: process.env.HF_TOKEN,
-            files: [{
+            title: `Upload ${outputName}`,
+            fetch: progressFetch,
+            operations: [{
+                operation: "addOrUpdate",
                 path: outputName,
                 content: pathToFileURL(outputName),
             }],
         })) {
-            // ignoring progress events, just letting the upload run to completion
+            if (event.event === "fileProgress" && event.state === "hashing") {
+                advanceTo(event.progress * 20, "Hashing...");
+            }
+            else if (event.event === "fileProgress" && event.state === "uploading") {
+                advanceTo(
+                    20 + event.progress * 79,
+                    `Uploading... ${formatBytes(event.progress * totalBytes)} / ${formatBytes(totalBytes)}`
+                );
+            }
+            else if (event.event === "phase" && event.phase === "committing") {
+                advanceTo(99, "Finalizing commit...");
+            }
         }
     } catch (err) {
-        uploadSpinner.stop("Upload failed");
+        uploadProgress.stop("Upload failed");
         logHFError(err);
         unlinkSync(outputName);
         // The key was registered when the Encoder was created — don't
@@ -99,7 +132,8 @@ export async function handleUploadProcess() {
         return;
     }
 
-    uploadSpinner.stop(`Uploaded ${formatBytes(totalBytes)}`);
+    advanceTo(100, "Upload complete");
+    uploadProgress.stop(`Uploaded ${formatBytes(totalBytes)}`);
 
     // Persist metadata — the AES key is already in the encrypted vault
     // (stored by Encoder.forNewFile), so files stay decryptable even after

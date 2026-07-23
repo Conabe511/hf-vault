@@ -6,8 +6,10 @@ import { randomBytes } from "crypto";
 import { formatBytes } from "../../utils/utils";
 import { KeyVault } from "../../cryptography/key-vault";
 import { ensureVaultOpen } from "../utils/vault-access";
+import { clearScreen } from "../utils/screen";
 
 export async function handleDownloadProcess() {
+    clearScreen();
     intro("Download File");
 
     const files = HFDataManager.getInstance().getFiles();

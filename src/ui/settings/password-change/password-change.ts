@@ -1,6 +1,7 @@
 import { cancel, intro, log, confirm, isCancel, note, password } from "@clack/prompts";
 import { KeyVault } from "../../../cryptography/key-vault";
 import { ensureVaultOpen } from "../../utils/vault-access";
+import { pressEnterToContinue } from "../../utils/screen";
 
 export async function passwordChangePage() {
     intro("Master Password");
@@ -55,6 +56,9 @@ export async function passwordChangePage() {
 
         KeyVault.getInstance().changePassword(psw.toString());
         log.success("Master password updated");
+        // Settings returns straight to the main menu (which clears the
+        // screen), so hold here until the success message has been read
+        await pressEnterToContinue();
         return;
     }
 }
