@@ -6,10 +6,14 @@ export async function createHFRepo(name: string) {
         throw Error("A HuggingFace token is required.")
     }
 
-    await createRepo({
-        accessToken: process.env.HF_TOKEN,
-        repo: "spaces/FrankyMaca/my-new-custom-space",
-        visibility: "public",
-    })
-    console.log("Created repo remotely")
+    try {
+        await createRepo({
+            accessToken: process.env.HF_TOKEN,
+            repo: "spaces/FrankyMaca/my-new-custom-space",
+            visibility: "public",
+        })
+    }
+    catch (err) {
+        console.log(err)
+    }
 }

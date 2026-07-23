@@ -11,9 +11,6 @@ config()
 
 const encrypt = false;
 
-import { createRepo } from '@huggingface/hub'
-
-console.log(process.env.HF_TOKEN)
 // (async () => {
 //   await createRepo({
 //     accessToken: "",
