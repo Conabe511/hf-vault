@@ -1,82 +1,38 @@
 import {
-  createCipheriv,
-  randomBytes,
-  createDecipheriv
+    createCipheriv,
+    randomBytes,
+    createDecipheriv
 } from "crypto";
 import { readFileSync as fsRead, writeFileSync as fsWrite } from "fs";
 import { intro, outro, isCancel, cancel, text } from '@clack/prompts'
+import { createReadStream } from "node:fs";
 
 import { config } from 'dotenv'
-config()
+import { Encoder } from "./cryptography/create-random-key";
+config();
 
-const encrypt = false;
+(async () => {
+  intro("Welcome to HF-VAULT")
+  const value = await text({
+    message: 'What is the meaning of life?',
+  });
 
-// (async () => {
-//   await createRepo({
-//     accessToken: "",
-//     repo: "spaces/FrankyMaca/my-new-custom-space",
-//     visibility: "public",
-//   })
-//   console.log("Created repo remotely")
-// })()
+  if (isCancel(value)) {
+    cancel('Operation cancelled.');
+    process.exit(0);
+  }
 
-// (async () => {
-//   intro("Welcome to HF-VAULT")
-//   const value = await text({
-//     message: 'What is the meaning of life?',
-//   });
-  
-//   if (isCancel(value)) {
-//     cancel('Operation cancelled.');
-//     process.exit(0);
-//   }
-  
-//   outro("File is on the ☁️")
-// })()
+  outro("File is on the ☁️")
+})();
 
-// if (encrypt) {
-//   const key = Buffer.from(
-//     "b45f6ba75c8306ac0530b1fd523bf7b1ba36c89722554070262bc233f25f744a",
-//     "hex"
-//   );
+(async () => {
+    const encoder = new Encoder()
 
-//   const iv = randomBytes(12);
+    await encoder.encryptFile("episode.mp4", "myfile.mp4")
 
-//   const plaintext = fsRead("test.txt");
+    console.log("finished encrypting")
 
-//   const cipher = createCipheriv("aes-256-gcm", key, iv);
+    await encoder.decryptFile("myfile.mp4", "out.mp4")
 
-//   const encrypted = Buffer.concat([
-//     cipher.update(plaintext),
-//     cipher.final(),
-//   ]);
-
-//   const tag = cipher.getAuthTag();
-
-//   fsWrite(
-//     "encrypted.bin",
-//     Buffer.concat([iv, tag, encrypted])
-//   );
-// }
-// else {
-//   const key = Buffer.from(
-//     "b45f6ba75c8306ac0530b1fd523bf7b1ba36c89722554070262bc233f25f744a",
-//     "hex"
-//   );
-
-//   const data = fsRead("encrypted.bin");
-
-//   const iv = data.subarray(0, 12);
-//   const tag = data.subarray(12, 28);
-//   const ciphertext = data.subarray(28);
-
-//   const decipher = createDecipheriv("aes-256-gcm", key, iv);
-//   decipher.setAuthTag(tag);
-
-//   const decrypted = Buffer.concat([
-//     decipher.update(ciphertext),
-//     decipher.final(),
-//   ]);
-
-//   fsWrite("output.txt", decrypted);
-// }
+    console.log("finished decrypting")
+})();
