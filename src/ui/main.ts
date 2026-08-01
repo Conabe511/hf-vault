@@ -5,7 +5,9 @@ import { invalidChoice } from "./utils/invalid";
 import { handleUploadProcess } from "./data/upload-section";
 import { handleUploadFolderProcess } from "./data/upload-folder-section";
 import { handleUploadFromUrlProcess } from "./data/upload-url-section";
+import { handleUploadVideoProcess } from "./data/upload-video-section";
 import { handleDownloadProcess } from "./data/download-section";
+import { handleDownloadVideoProcess } from "./data/download-video-section";
 import { handleListFiles } from "./data/list-files";
 import { handleSyncProcess } from "./data/sync-section";
 import { clearScreen, pressEnterToContinue } from "./utils/screen";
@@ -28,7 +30,9 @@ export async function start() {
                 { value: "upload", "label": "Upload a file to Cloud" },
                 { value: "upload-folder", "label": "Upload a folder to Cloud", hint: "recursive, mirrors subfolders into a vault folder" },
                 { value: "upload-url", "label": "Upload from a URL", hint: "e.g. a Copyparty link — no permanent local copy" },
+                { value: "upload-video", "label": "Upload a video (HLS)", hint: "chunked + AES-128 encrypted, playable in VLC" },
                 { value: "download", "label": "Download a file to your PC" },
+                { value: "download-video", "label": "Download a video (HLS)", hint: "reconstructs a VLC-playable local folder" },
                 { value: "list", "label": "List your vault files" },
                 { value: "sync", "label": "Synchronize with remote" },
                 { value: "settings", "label": "Change settings..."},
@@ -61,8 +65,18 @@ export async function start() {
                 outro("Done ☁️")
                 await pressEnterToContinue();
                 break;
+            case "upload-video":
+                await handleUploadVideoProcess();
+                outro("Done ☁️")
+                await pressEnterToContinue();
+                break;
             case "download":
                 await handleDownloadProcess();
+                outro("Done ☁️")
+                await pressEnterToContinue();
+                break;
+            case "download-video":
+                await handleDownloadVideoProcess();
                 outro("Done ☁️")
                 await pressEnterToContinue();
                 break;

@@ -63,7 +63,10 @@ export async function handleDownloadProcess() {
         return;
     }
 
-    if (!KeyVault.getInstance().hasKey(entry.id)) {
+    // Raw entries (e.g. HLS video segments) were never given a key here —
+    // their content is used byte-for-byte, encrypted (if at all) under
+    // their own separate scheme, so there's nothing for this vault to decrypt.
+    if (!entry.raw && !KeyVault.getInstance().hasKey(entry.id)) {
         log.error(
             `No decryption key found for "${entry.name}" in the vault. ` +
             `The file cannot be decrypted without it.`
@@ -74,6 +77,12 @@ export async function handleDownloadProcess() {
     const cipherBuffer = await fetchAndReconstruct(entry);
     if (!cipherBuffer) {
         log.error(`Could not download/reconstruct "${entry.name}" — see the messages above.`);
+        return;
+    }
+
+    if (entry.raw) {
+        writeFileSync(destStr, cipherBuffer);
+        log.success(`File saved to ${destStr}`);
         return;
     }
 
@@ -95,15 +104,18 @@ export async function handleDownloadProcess() {
 }
 
 /**
- * Downloads and reassembles a file's ciphertext from its shards,
- * tolerating unreachable accounts according to its RAID mode:
- * - none: the single shard IS the ciphertext, nothing to reassemble.
+ * Downloads and reassembles a file's ciphertext (or, for raw entries,
+ * its final bytes directly) from its shards, tolerating unreachable
+ * accounts according to its RAID mode:
+ * - none: the single shard IS the content, nothing to reassemble.
  * - raid1: any one reachable mirror is enough.
  * - raid0: no redundancy — every data shard must be reachable.
  * - raid6: missing data shards are reconstructed from P/Q parity, up to 2.
  * Returns null (after logging why) when the file can't be recovered.
+ * Exported for reuse by other flows that need an entry's raw bytes
+ * (currently: download-video-section.ts, for HLS segments/asset records).
  */
-async function fetchAndReconstruct(entry: HFFileEntry): Promise<Buffer | null> {
+export async function fetchAndReconstruct(entry: HFFileEntry): Promise<Buffer | null> {
     const accounts = resolveAccounts();
     const accountFor = (id: string) => accounts.find(a => a.id === id);
 

@@ -113,6 +113,17 @@ export interface HFFileEntry {
     // manifest, since a folder path can be just as identifying as a
     // filename (e.g. "Taxes/Divorce documents").
     folder: string;
+
+    // When true, upload/download use the shard bytes exactly as given —
+    // no AES-256-GCM pass, no key registered in the vault under this
+    // fileId. For content that arrives pre-encrypted under its own,
+    // separate key (currently: HLS video segments, AES-128-CBC via
+    // ffmpeg) and must stay byte-identical on the wire — running it
+    // through this app's own cipher on top would just be a second,
+    // pointless encryption layer with no benefit and would break e.g.
+    // HLS players expecting the segment bytes to decrypt directly under
+    // their own key. iv/tag are unused (empty) for raw entries.
+    raw: boolean;
 }
 
 /** "", "/", "a//b/", "a\\b" -> "", "", "a/b", "a/b" — the on-disk/DB canonical form. */
@@ -147,7 +158,8 @@ function ensureSchema(db: Database) {
             tag           TEXT NOT NULL,
             raid          TEXT NOT NULL,
             cipher_length INTEGER NOT NULL,
-            folder        TEXT NOT NULL DEFAULT ''
+            folder        TEXT NOT NULL DEFAULT '',
+            raw           INTEGER NOT NULL DEFAULT 0
         )
     `);
     db.run(`
@@ -162,12 +174,15 @@ function ensureSchema(db: Database) {
         )
     `);
 
-    // `folder` was added after the initial schema — existing .hfcoll.db
-    // files won't have it yet. CREATE TABLE IF NOT EXISTS is a no-op on
-    // those, so the column has to be added out-of-band.
+    // `folder`/`raw` were added after the initial schema — existing
+    // .hfcoll.db files won't have them yet. CREATE TABLE IF NOT EXISTS is
+    // a no-op on those, so the columns have to be added out-of-band.
     const columns = db.query("PRAGMA table_info(files)").all() as { name: string }[];
     if (!columns.some(c => c.name === "folder")) {
         db.run("ALTER TABLE files ADD COLUMN folder TEXT NOT NULL DEFAULT ''");
+    }
+    if (!columns.some(c => c.name === "raw")) {
+        db.run("ALTER TABLE files ADD COLUMN raw INTEGER NOT NULL DEFAULT 0");
     }
 }
 
@@ -218,7 +233,7 @@ function migrateLegacyCollection(dbPath: string) {
 
 interface FileRow {
     id: string; name: string; size: number; mime: string; created_at: string;
-    iv: string; tag: string; raid: string; cipher_length: number; folder: string;
+    iv: string; tag: string; raid: string; cipher_length: number; folder: string; raw: number;
 }
 
 interface ShardRow {
@@ -259,6 +274,7 @@ export class HFDataManager {
             raid: fileRow.raid as RaidMode,
             cipherLength: fileRow.cipher_length,
             folder: fileRow.folder,
+            raw: fileRow.raw !== 0,
             shards: shardRows
                 .filter(s => s.file_id === fileRow.id)
                 .sort((a, b) => a.shard_index - b.shard_index)
@@ -274,8 +290,8 @@ export class HFDataManager {
 
     addFile(file: HFFileEntry) {
         const insertFile = this.db.prepare(
-            `INSERT INTO files (id, name, size, mime, created_at, iv, tag, raid, cipher_length, folder)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            `INSERT INTO files (id, name, size, mime, created_at, iv, tag, raid, cipher_length, folder, raw)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         const insertShard = this.db.prepare(
             `INSERT INTO shards (file_id, account_id, repository, path, role, shard_index)
@@ -283,7 +299,7 @@ export class HFDataManager {
         );
 
         const tx = this.db.transaction((f: HFFileEntry) => {
-            insertFile.run(f.id, f.name, f.size, f.mime, f.createdAt, f.iv, f.tag, f.raid, f.cipherLength, normalizeFolder(f.folder));
+            insertFile.run(f.id, f.name, f.size, f.mime, f.createdAt, f.iv, f.tag, f.raid, f.cipherLength, normalizeFolder(f.folder), f.raw ? 1 : 0);
             for (const s of f.shards) {
                 insertShard.run(f.id, s.accountId, s.repository, s.path, s.role, s.index);
             }

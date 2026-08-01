@@ -61,6 +61,14 @@ your file ──> AES-256-GCM encrypt ──> RAID split/mirror ──> one blob
   never written to the remote manifest.
 - **The master password has no reset.** Neither Hugging Face nor HF-VAULT
   ever sees it. Lose it and the files are gone for good — that's the point.
+- **HLS video upload** chunks a video with ffmpeg (stream copy, no
+  re-encode) into standard HLS segments, encrypted with ffmpeg's native
+  AES-128 — the same scheme every HLS-aware player (VLC included)
+  decrypts on its own, given the key. That key is random per video,
+  separate from every other key in the vault, and **never uploaded
+  anywhere** — it only ever lives in `.hfkey`. Segments and the playlist
+  are otherwise handled like any other file (RAID/redundancy applies to
+  the encrypted asset record; see *HLS video details* below).
 
 ## Features
 
@@ -92,8 +100,63 @@ your file ──> AES-256-GCM encrypt ──> RAID split/mirror ──> one blob
   remote shard **manifest** describes but that have no local record (e.g.
   after `.hfcoll.db` was lost) — lets you import, rebuild, or delete them
 - Per-file remote deletion from the file list (every shard + manifest copy)
+- **Upload a video (HLS)** / **Download a video (HLS)** — see *HLS video
+  details* below
 - Master password change (re-encrypts the vault)
 - First-run guided setup
+
+## HLS video details
+
+Requires `ffmpeg` in `PATH` for uploading (segmentation + encryption);
+`ffprobe` is optional (used only for a duration estimate shown before
+you confirm). Downloading needs neither — it's pure file I/O.
+
+> This feature was inspired by
+> [Conabe511/polyglot-chunker](https://github.com/Conabe511/polyglot-chunker),
+> which chunks video into files that are simultaneously valid PNGs and
+> valid MPEG-TS streams (a format-confusion trick, not encryption — a
+> repo visitor with the file could still watch it). What's implemented
+> here instead is ffmpeg's native HLS **AES-128 encryption**, since
+> that's real confidentiality that any standard HLS player already
+> speaks, and doesn't need a PNG disguise on top.
+
+Uploading a video (`Upload a video (HLS)`) does the following:
+
+1. Runs `ffmpeg -c copy -f hls -hls_key_info_file ...` locally — segments
+   the video (no re-encoding) into `.ts` chunks and encrypts each one
+   under a **freshly random AES-128 key and IV** using ffmpeg's own HLS
+   encryption support, producing a standard `.m3u8` playlist with an
+   `EXT-X-KEY` tag referencing that key by filename.
+2. The key is stored **only** in your local `.hfkey` (never uploaded, not
+   even encrypted) — it has nothing to do with this vault's own AES-256
+   keys. The playlist's key reference is a bare relative filename
+   (`hls.key`); that file is never created on the remote at all, only
+   materialized locally at download time.
+3. Each segment is uploaded as a plain, single-account file (segments are
+   already "chunked" by nature, so they skip this vault's RAID
+   striping/mirroring — see the caveat below). An **asset record** (JSON:
+   the playlist text, the key's filename, and which segment maps to which
+   uploaded file) is uploaded as a normal, fully encrypted, RAID-protected
+   file named `<video>.hlsasset.json` — this is what ties everything
+   together and is itself protected the same way any other file in your
+   vault is.
+
+Downloading (`Download a video (HLS)`) reverses this: decrypts the asset
+record, downloads every segment under its original filename, writes the
+playlist text and the key (read back from `.hfkey`) into the same local
+folder, and tells you where to point VLC.
+
+**Caveat**: segments currently upload to a single account with no RAID
+redundancy of their own (only the asset record that ties them together
+does). Losing that one account loses the video's segments even though the
+asset record survives. This keeps the feature's first version simpler;
+letting segments use the same RAID/repair/rebalance machinery as regular
+files is a reasonable follow-up if it turns out to matter in practice.
+
+**Source compatibility**: stream copy means the source codec must already
+be HLS-friendly — H.264 video / AAC audio is the safe bet (what most
+MP4/MKV files already contain). ffmpeg will fail plainly if the source
+codec can't be muxed into MPEG-TS.
 
 ## Getting started (development)
 

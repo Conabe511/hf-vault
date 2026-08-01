@@ -289,6 +289,7 @@ export async function uploadOneFile(
         cipherLength,
         shards,
         folder,
+        raw: false,
     };
 
     // Persist metadata — the AES key is already in the encrypted vault
