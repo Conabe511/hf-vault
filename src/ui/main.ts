@@ -1,7 +1,8 @@
-import { cancel, intro, isCancel, select, outro } from "@clack/prompts";
+import { cancel, intro, isCancel, log, select, outro } from "@clack/prompts";
 import color from 'picocolors'
 import { settingsPage } from "./settings/settings";
 import { invalidChoice } from "./utils/invalid";
+import { startWebServer } from "../web/server";
 import { handleUploadProcess } from "./data/upload-section";
 import { handleUploadFolderProcess } from "./data/upload-folder-section";
 import { handleUploadFromUrlProcess } from "./data/upload-url-section";
@@ -13,12 +14,17 @@ import { handleSyncProcess } from "./data/sync-section";
 import { clearScreen, pressEnterToContinue } from "./utils/screen";
 import { configurationPage } from "./settings/configuration/configuration";
 
+const WEB_PORT = parseInt(process.env.HFV_WEB_PORT ?? "4173", 10) || 4173;
+const WEB_HOST = "127.0.0.1";
+
 export async function start() {
     // The app is unusable without a token and a repository: when either is
     // missing (fresh install, no .env / .hfconf) run the setup first
     if (!process.env.HF_TOKEN || !process.env.HF_REPO) {
         await configurationPage(true);
     }
+
+    let webServerUrl: string | undefined;
 
     while (true) {
         clearScreen();
@@ -36,6 +42,11 @@ export async function start() {
                 { value: "list", "label": "List your vault files" },
                 { value: "sync", "label": "Synchronize with remote" },
                 { value: "settings", "label": "Change settings..."},
+                {
+                    value: "web",
+                    label: webServerUrl ? "Web UI is running" : "Start Web UI",
+                    hint: webServerUrl ?? "bulk upload/download from a browser — accounts/RAID/video stay CLI-only",
+                },
                 { value: "exit", "label": "Exit"}
             ]
         });
@@ -90,6 +101,14 @@ export async function start() {
                 break;
             case "settings":
                 await settingsPage();
+                break;
+            case "web":
+                if (!webServerUrl) {
+                    startWebServer(WEB_PORT, WEB_HOST);
+                    webServerUrl = `http://${WEB_HOST}:${WEB_PORT}`;
+                }
+                log.success(`Web UI running at ${webServerUrl} (shares this session's vault — unlocking one unlocks both).`);
+                await pressEnterToContinue();
                 break;
             case "exit":
                 cancel("Good bye!")

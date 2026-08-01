@@ -102,8 +102,33 @@ your file ──> AES-256-GCM encrypt ──> RAID split/mirror ──> one blob
 - Per-file remote deletion from the file list (every shard + manifest copy)
 - **Upload a video (HLS)** / **Download a video (HLS)** — see *HLS video
   details* below
+- **Web UI** for bulk upload/download from a browser — see *Web UI* below
 - Master password change (re-encrypts the vault)
 - First-run guided setup
+
+## Web UI
+
+Start it from the CLI's main menu (*Start Web UI*) or run `hfv web` /
+`yarn start web` directly — either way it serves on
+`http://127.0.0.1:4173` (override the port with `HFV_WEB_PORT`).
+Loopback-only and not configurable to bind elsewhere: the web server uses
+plain HTTP and a lighter auth model than the CLI (a session cookie gated
+behind the master password — see `src/web/server.ts` for the exact
+threat model), both fine for "another process on this machine," neither
+fine for exposing over a network as-is. Put a reverse proxy with TLS in
+front if you actually want remote access.
+
+It covers the bulk-oriented core workflow: browse vault folders, drag-and-
+drop or multi-select upload, select multiple files and download them as a
+single `.zip`, delete, and move between folders. **Accounts, RAID mode,
+and HLS video are CLI-only** — deliberately not exposed over HTTP, to
+keep the web surface small (token/account management especially isn't
+something to expose to a browser without a lot more hardening than a
+personal tool like this warrants). Running the web UI from within an
+already-open CLI session shares that session's unlocked vault; started
+standalone (`hfv web`), it starts locked and unlocks the same way the CLI
+does (master password — first run creates the vault, same as the CLI's
+first-run flow).
 
 ## HLS video details
 
