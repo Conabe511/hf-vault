@@ -3,18 +3,19 @@ import { commitIter, deleteFile, repoExists } from "@huggingface/hub"
 import { randomBytes } from "crypto"
 import { readFileSync, unlinkSync, writeFileSync } from "fs"
 import { pathToFileURL } from "url"
-import { inspectFile, createHFRepo, HFDataManager, HFShard } from "../../hf/actions"
-import { resolveAccounts } from "../../hf/accounts"
+import { inspectFile, createHFRepo, HFDataManager, HFFileEntry, HFShard } from "../../hf/actions"
+import { HFAccount, resolveAccounts } from "../../hf/accounts"
 import { buildManifest, uploadManifest } from "../../hf/manifest"
 import { resolveEffectiveRaid, planUpload } from "../../raid/layout"
 import { splitIntoShards } from "../../raid/chunk"
 import { computeParity } from "../../raid/parity"
-import { RaidMode, ShardAssignment } from "../../raid/types"
+import { RaidMode, ShardAssignment, UploadPlan } from "../../raid/types"
 import { formatBytes, logHFError, mimeFromExtension } from "../../utils/utils"
 import { readRaidMode } from "../../utils/hfconf"
 import { Encoder } from "../../cryptography/encoder"
 import { KeyVault } from "../../cryptography/key-vault"
 import { ensureVaultOpen } from "../utils/vault-access"
+import { pickFolder } from "../utils/folder-picker"
 import { clearScreen } from "../utils/screen"
 
 export async function handleUploadProcess() {
@@ -57,10 +58,49 @@ export async function handleUploadProcess() {
         return;
     }
 
+    const folder = await pickFolder(HFDataManager.getInstance().listFolders(), "Which vault folder should this go into?");
+    if (folder === undefined) {
+        cancel("Upload cancelled");
+        return;
+    }
+
+    const plan = await prepareUploadPlan();
+    if (!plan) return;
+
+    const result = await uploadOneFile(filePathStr, folder, plan);
+
+    if (!result.ok) {
+        return;
+    }
+
+    const deleteOriginal = await confirm({
+        message: "Delete original file after successful upload?"
+    });
+
+    if (!isCancel(deleteOriginal) && deleteOriginal) {
+        unlinkSync(filePathStr);
+        log.success("Original file deleted.");
+    }
+
+    log.success(`Upload complete — id: ${result.fileId}`);
+}
+
+interface PreparedUploadPlan {
+    mode: RaidMode;
+    plan: UploadPlan;
+    uniqueAccounts: HFAccount[];
+}
+
+/**
+ * Resolves accounts/RAID mode/shard plan and makes sure every repo the
+ * plan touches exists — once per batch (single file or a whole folder),
+ * not once per file, since it's about the accounts, not any one file.
+ */
+export async function prepareUploadPlan(): Promise<PreparedUploadPlan | null> {
     const accounts = resolveAccounts();
     if (accounts.length === 0) {
         cancel("No Hugging Face account is configured yet — set one up in Settings -> Configuration.");
-        return;
+        return null;
     }
 
     const { mode, reason } = resolveEffectiveRaid(readRaidMode(), accounts.length);
@@ -71,7 +111,6 @@ export async function handleUploadProcess() {
     const plan = planUpload(mode, accounts);
     const uniqueAccounts = [...new Map(plan.assignments.map(a => [a.account.id, a.account])).values()];
 
-    // Ensure every repo this upload touches exists
     const repoSpinner = spinner();
     repoSpinner.start("Checking repositories...");
 
@@ -83,9 +122,24 @@ export async function handleUploadProcess() {
     }
     repoSpinner.stop("Repositories ready");
 
+    return { mode, plan, uniqueAccounts };
+}
+
+/**
+ * Encrypts, RAID-splits, uploads, and tracks one file under the given
+ * vault folder, using an already-resolved upload plan (see
+ * prepareUploadPlan). Shared by the single-file and folder upload flows.
+ */
+export async function uploadOneFile(
+    filePathStr: string,
+    folder: string,
+    { mode, plan, uniqueAccounts }: PreparedUploadPlan
+): Promise<{ ok: true; fileId: string } | { ok: false }> {
+    const metadata = await inspectFile(filePathStr);
+
     // Encrypt — spinner since it's local I/O and fast relative to upload
     const encSpinner = spinner();
-    encSpinner.start("Encrypting file...");
+    encSpinner.start(`Encrypting ${metadata.name}...`);
     const fileId = randomBytes(16).toString("hex");
     const encoder = Encoder.forNewFile(fileId);
     const tempCipherPath = randomBytes(16).toString("hex");
@@ -99,7 +153,7 @@ export async function handleUploadProcess() {
     const totalBytes = [...shardBuffers.values()].reduce((sum, b) => sum + b.length, 0);
 
     const uploadProgress = progress({ max: 100 });
-    uploadProgress.start("Preparing upload...");
+    uploadProgress.start(`Preparing upload of ${metadata.name}...`);
 
     // Same monotonic advance() trick as a single-shard upload, just scaled
     // to give each shard a slice of the 0-100 bar proportional to its size
@@ -187,11 +241,11 @@ export async function handleUploadProcess() {
 
         unlinkSync(tempCipherPath);
         KeyVault.getInstance().deleteKey(fileId);
-        return;
+        return { ok: false };
     }
 
     advanceTo(100, "Upload complete");
-    uploadProgress.stop(`Uploaded ${formatBytes(totalBytes)} across ${shardEntries.length} shard(s)`);
+    uploadProgress.stop(`Uploaded ${metadata.name} — ${formatBytes(totalBytes)} across ${shardEntries.length} shard(s)`);
 
     const shards: HFShard[] = uploaded.map(({ assignment, path: blobPath }) => ({
         accountId: assignment.account.id,
@@ -218,10 +272,7 @@ export async function handleUploadProcess() {
     }
     manifestSpinner.stop("Manifest written");
 
-    // Persist metadata — the AES key is already in the encrypted vault
-    // (stored by Encoder.forNewFile), so files stay decryptable even after
-    // an app reset (e.g. .hfcoll.db being wiped/rebuilt) as long as .hfkey survives
-    HFDataManager.getInstance().addFile({
+    const entry: HFFileEntry = {
         id: fileId,
         name: metadata.name,
         size: metadata.size,
@@ -232,20 +283,17 @@ export async function handleUploadProcess() {
         raid: mode,
         cipherLength,
         shards,
-    });
+        folder,
+    };
+
+    // Persist metadata — the AES key is already in the encrypted vault
+    // (stored by Encoder.forNewFile), so files stay decryptable even after
+    // an app reset (e.g. .hfcoll.db being wiped/rebuilt) as long as .hfkey survives
+    HFDataManager.getInstance().addFile(entry);
 
     unlinkSync(tempCipherPath);
 
-    const deleteOriginal = await confirm({
-        message: "Delete original file after successful upload?"
-    });
-
-    if (!isCancel(deleteOriginal) && deleteOriginal) {
-        unlinkSync(filePathStr);
-        log.success("Original file deleted.");
-    }
-
-    log.success(`Upload complete — id: ${fileId}`);
+    return { ok: true, fileId };
 }
 
 /** Slices/replicates the encrypted buffer into one Buffer per shard assignment, per RAID mode. */

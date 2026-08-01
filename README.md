@@ -45,12 +45,29 @@ your file ──> AES-256-GCM encrypt ──> RAID split/mirror ──> one blob
     down at once while still pooling most of their storage. Needs 4+ accounts.
   - If fewer accounts are configured than a mode needs at upload time,
     HF-VAULT falls back to a simpler mode automatically and says so.
+  - RAID assignment happens once, at upload time. Adding an account
+    later only affects files uploaded *after* that (a wider stripe/parity
+    split going forward) — it does **not** rebalance/re-stripe files
+    already uploaded. Sync's repair only reconstructs shards that are
+    confirmed missing; it never touches a file with no missing shards,
+    so there's no "grow the array" operation to run after adding an account.
+- **Vault folders** are purely virtual — organize files into folders from
+  *List your vault files* independently of both the local filesystem they
+  came from and the (still randomly-named, flat) remote blob layout.
+  Like a filename, a folder path stays local-only (`.hfcoll.db`) and is
+  never written to the remote manifest.
 - **The master password has no reset.** Neither Hugging Face nor HF-VAULT
   ever sees it. Lose it and the files are gone for good — that's the point.
 
 ## Features
 
 - Upload with encryption, download with decryption — with real progress bars
+- Recursive folder upload, mirroring a local directory's subfolder
+  structure into a chosen vault folder; single-file uploads can also be
+  filed into a vault folder directly. Vault folders are a virtual
+  organization layer, independent of local disk layout and the remote's
+  (still flat, randomly-named) blob layout — files can also be moved
+  between vault folders after the fact
 - Multi-account RAID0/RAID1/RAID6 storage pooling and redundancy
 - File list with live, shard-aware remote status (synced / degraded /
   lost / unknown) and storage usage across every configured account

@@ -105,6 +105,24 @@ export interface HFFileEntry {
     raid: RaidMode;
     cipherLength: number;
     shards: HFShard[];
+
+    // Purely local/virtual organization — "" is the root, "Photos/2024"
+    // etc. otherwise. Independent of both the local filesystem path this
+    // file came from and the remote blob name (still random hex): like
+    // `name`, this stays local-only and is never written to the remote
+    // manifest, since a folder path can be just as identifying as a
+    // filename (e.g. "Taxes/Divorce documents").
+    folder: string;
+}
+
+/** "", "/", "a//b/", "a\\b" -> "", "", "a/b", "a/b" — the on-disk/DB canonical form. */
+export function normalizeFolder(path: string): string {
+    return path
+        .replace(/\\/g, "/")
+        .split("/")
+        .map(segment => segment.trim())
+        .filter(segment => segment.length > 0)
+        .join("/");
 }
 
 // Legacy pre-RAID .hfcoll JSON shape — read once, for migration only.
@@ -128,7 +146,8 @@ function ensureSchema(db: Database) {
             iv            TEXT NOT NULL,
             tag           TEXT NOT NULL,
             raid          TEXT NOT NULL,
-            cipher_length INTEGER NOT NULL
+            cipher_length INTEGER NOT NULL,
+            folder        TEXT NOT NULL DEFAULT ''
         )
     `);
     db.run(`
@@ -142,6 +161,14 @@ function ensureSchema(db: Database) {
             PRIMARY KEY (file_id, account_id, path)
         )
     `);
+
+    // `folder` was added after the initial schema — existing .hfcoll.db
+    // files won't have it yet. CREATE TABLE IF NOT EXISTS is a no-op on
+    // those, so the column has to be added out-of-band.
+    const columns = db.query("PRAGMA table_info(files)").all() as { name: string }[];
+    if (!columns.some(c => c.name === "folder")) {
+        db.run("ALTER TABLE files ADD COLUMN folder TEXT NOT NULL DEFAULT ''");
+    }
 }
 
 /**
@@ -191,7 +218,7 @@ function migrateLegacyCollection(dbPath: string) {
 
 interface FileRow {
     id: string; name: string; size: number; mime: string; created_at: string;
-    iv: string; tag: string; raid: string; cipher_length: number;
+    iv: string; tag: string; raid: string; cipher_length: number; folder: string;
 }
 
 interface ShardRow {
@@ -231,6 +258,7 @@ export class HFDataManager {
             tag: fileRow.tag,
             raid: fileRow.raid as RaidMode,
             cipherLength: fileRow.cipher_length,
+            folder: fileRow.folder,
             shards: shardRows
                 .filter(s => s.file_id === fileRow.id)
                 .sort((a, b) => a.shard_index - b.shard_index)
@@ -246,8 +274,8 @@ export class HFDataManager {
 
     addFile(file: HFFileEntry) {
         const insertFile = this.db.prepare(
-            `INSERT INTO files (id, name, size, mime, created_at, iv, tag, raid, cipher_length)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+            `INSERT INTO files (id, name, size, mime, created_at, iv, tag, raid, cipher_length, folder)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         );
         const insertShard = this.db.prepare(
             `INSERT INTO shards (file_id, account_id, repository, path, role, shard_index)
@@ -255,13 +283,24 @@ export class HFDataManager {
         );
 
         const tx = this.db.transaction((f: HFFileEntry) => {
-            insertFile.run(f.id, f.name, f.size, f.mime, f.createdAt, f.iv, f.tag, f.raid, f.cipherLength);
+            insertFile.run(f.id, f.name, f.size, f.mime, f.createdAt, f.iv, f.tag, f.raid, f.cipherLength, normalizeFolder(f.folder));
             for (const s of f.shards) {
                 insertShard.run(f.id, s.accountId, s.repository, s.path, s.role, s.index);
             }
         });
 
         tx(file);
+    }
+
+    /** Moves a file to a different virtual vault folder — purely local, no remote effect. */
+    moveFile(id: string, folder: string) {
+        this.db.run("UPDATE files SET folder = ? WHERE id = ?", [normalizeFolder(folder), id]);
+    }
+
+    /** Every distinct non-root folder path currently in use, for picker suggestions. */
+    listFolders(): string[] {
+        const rows = this.db.query("SELECT DISTINCT folder FROM files WHERE folder != '' ORDER BY folder").all() as { folder: string }[];
+        return rows.map(r => r.folder);
     }
 
     getFiles(): HFFileEntry[] {

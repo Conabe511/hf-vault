@@ -312,6 +312,7 @@ async function manageRebuildableFiles(manifests: HFManifest[]) {
             raid: manifest.raid,
             cipherLength: manifest.cipherLength,
             shards: manifest.shards,
+            folder: "",
         });
 
         // Its manifest only decrypted (see the caller) because the vault
@@ -460,6 +461,7 @@ async function importForeignFile(item: { account: HFAccount; file: RemoteFile })
             role: "data",
             index: 0,
         }],
+        folder: "",
     });
 
     log.success(

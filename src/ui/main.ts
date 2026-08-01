@@ -3,6 +3,7 @@ import color from 'picocolors'
 import { settingsPage } from "./settings/settings";
 import { invalidChoice } from "./utils/invalid";
 import { handleUploadProcess } from "./data/upload-section";
+import { handleUploadFolderProcess } from "./data/upload-folder-section";
 import { handleDownloadProcess } from "./data/download-section";
 import { handleListFiles } from "./data/list-files";
 import { handleSyncProcess } from "./data/sync-section";
@@ -24,6 +25,7 @@ export async function start() {
             message: 'Hello! What files you want to upload today?',
             options: [
                 { value: "upload", "label": "Upload a file to Cloud" },
+                { value: "upload-folder", "label": "Upload a folder to Cloud", hint: "recursive, mirrors subfolders into a vault folder" },
                 { value: "download", "label": "Download a file to your PC" },
                 { value: "list", "label": "List your vault files" },
                 { value: "sync", "label": "Synchronize with remote" },
@@ -44,6 +46,11 @@ export async function start() {
             // land straight back here without any "Done" ceremony.
             case "upload":
                 await handleUploadProcess();
+                outro("Done ☁️")
+                await pressEnterToContinue();
+                break;
+            case "upload-folder":
+                await handleUploadFolderProcess();
                 outro("Done ☁️")
                 await pressEnterToContinue();
                 break;

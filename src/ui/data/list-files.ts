@@ -6,6 +6,7 @@ import { HFAccount, resolveAccounts } from "../../hf/accounts";
 import { deleteManifest } from "../../hf/manifest";
 import { EntryStatus, RemoteIndex, entryStatus, fetchRemoteIndex, shardStatus } from "../../raid/status";
 import { formatBytes, logHFError } from "../../utils/utils";
+import { pickFolder } from "../utils/folder-picker";
 import { clearScreen, pressEnterToContinue } from "../utils/screen";
 
 type VaultEntry = HFFileEntry;
@@ -27,6 +28,26 @@ function formatUsage(usedBytes: number): string {
     const pctLabel = pct > 0 && pct < 1 ? "<1%" : `${pct.toFixed(0)}%`;
 
     return `☁  ${formatBytes(usedBytes)} used of ${formatBytes(STORAGE_TOTAL_BYTES)} (${pctLabel})`;
+}
+
+/** Immediate child folder names of `currentFolder` (one level down, not recursive). */
+function childFolders(files: VaultEntry[], currentFolder: string): string[] {
+    const names = new Set<string>();
+
+    for (const f of files) {
+        if (currentFolder === "") {
+            if (f.folder === "") continue;
+            names.add(f.folder.split("/")[0]);
+        }
+        else {
+            const prefix = `${currentFolder}/`;
+            if (!f.folder.startsWith(prefix)) continue;
+            const rest = f.folder.slice(prefix.length);
+            if (rest) names.add(rest.split("/")[0]);
+        }
+    }
+
+    return [...names].sort();
 }
 
 // Hold the screen with a Back option — a bare log line would be wiped
@@ -61,9 +82,10 @@ export async function handleListFiles() {
     remoteSpinner.stop("Remote status loaded");
 
     let bytesShown = usedBytes;
+    let currentFolder = "";
 
-    // Browse loop, redrawn in place: list -> details page of the picked
-    // file (with its actions) -> back to the list
+    // Browse loop, redrawn in place: folder navigation <-> file details page
+    // (with its actions) -> back to whichever folder we were in
     while (true) {
         clearScreen();
         intro("Your Vault Files");
@@ -76,12 +98,22 @@ export async function handleListFiles() {
         );
 
         log.info(color.cyan(formatUsage(bytesShown)));
+        log.info(color.dim(`📁 ${currentFolder || "/"}`));
+
+        const subfolders = childFolders(files, currentFolder);
+        const filesHere = files.filter(f => f.folder === currentFolder);
+
+        if (subfolders.length === 0 && filesHere.length === 0) {
+            log.warn("This folder is empty.");
+        }
 
         const choice = await select({
-            message: `${files.length} file(s) in your vault — select one for details:`,
-            maxItems: 8, // keeps long collections scrollable instead of flooding the screen
+            message: `${filesHere.length} file(s), ${subfolders.length} folder(s) here — select one:`,
+            maxItems: 10,
             options: [
-                ...files.map(f => ({
+                ...(currentFolder ? [{ value: "up", label: color.dim("← ..") }] : []),
+                ...subfolders.map(name => ({ value: `folder:${name}`, label: `📁 ${name}` })),
+                ...filesHere.map(f => ({
                     value: f.id,
                     label: `${STATUS_ICON[entryStatus(remoteIndex, f)]} ${f.name}`,
                     hint: `${formatBytes(f.size)} — ${f.raid.toUpperCase()} — ${new Date(f.createdAt).toLocaleDateString()}`,
@@ -90,10 +122,26 @@ export async function handleListFiles() {
             ],
         });
 
-        // Straight back to the main menu — it redraws immediately,
-        // so any farewell message here would be wiped before it's seen
-        if (isCancel(choice) || choice === "back") {
+        if (isCancel(choice)) return;
+
+        if (choice === "back") {
+            // At root, back leaves to the main menu; otherwise it's "back
+            // out of this whole browse session", also to the main menu —
+            // navigating up a folder uses ".." explicitly instead
             return;
+        }
+
+        if (choice === "up") {
+            currentFolder = currentFolder.includes("/")
+                ? currentFolder.slice(0, currentFolder.lastIndexOf("/"))
+                : "";
+            continue;
+        }
+
+        if (typeof choice === "string" && choice.startsWith("folder:")) {
+            const name = choice.slice("folder:".length);
+            currentFolder = currentFolder ? `${currentFolder}/${name}` : name;
+            continue;
         }
 
         const entry = files.find(f => f.id === choice);
@@ -111,6 +159,9 @@ export async function handleListFiles() {
                 return;
             }
         }
+        // "moved" needs no extra bookkeeping here: fileDetailsPage already
+        // mutated entry.folder in place, and the next loop iteration
+        // recomputes subfolders/filesHere from the same `files` array
     }
 }
 
@@ -118,7 +169,7 @@ function accountLabel(accounts: HFAccount[], accountId: string): string {
     return accounts.find(a => a.id === accountId)?.label ?? accountId;
 }
 
-async function fileDetailsPage(entry: VaultEntry, remoteIndex: RemoteIndex, accounts: HFAccount[]): Promise<"back" | "deleted"> {
+async function fileDetailsPage(entry: VaultEntry, remoteIndex: RemoteIndex, accounts: HFAccount[]): Promise<"back" | "deleted" | "moved"> {
     while (true) {
         clearScreen();
         intro("File Details");
@@ -135,6 +186,7 @@ async function fileDetailsPage(entry: VaultEntry, remoteIndex: RemoteIndex, acco
 
         note(
             `Name:        ${entry.name}\n` +
+            `Folder:      ${entry.folder || "/"}\n` +
             `Size:        ${formatBytes(entry.size)}\n` +
             `Type:        ${entry.mime}\n` +
             `Uploaded:    ${new Date(entry.createdAt).toLocaleString()}\n` +
@@ -150,12 +202,24 @@ async function fileDetailsPage(entry: VaultEntry, remoteIndex: RemoteIndex, acco
             message: "What do you want to do?",
             options: [
                 { value: "back", label: color.dim("← Back to the list") },
+                { value: "move", label: "Move to another folder", hint: "vault-only — doesn't touch anything on disk or remotely" },
                 { value: "delete", label: "Delete this file", hint: "removes every shard/manifest from the remote and stops tracking it" },
             ],
         });
 
         if (isCancel(action) || action === "back") {
             return "back";
+        }
+
+        if (action === "move") {
+            const newFolder = await pickFolder(HFDataManager.getInstance().listFolders(), `Move "${entry.name}" to:`);
+            if (newFolder === undefined) continue;
+
+            HFDataManager.getInstance().moveFile(entry.id, newFolder);
+            entry.folder = newFolder;
+
+            log.success(`Moved "${entry.name}" to ${newFolder || "/"}.`);
+            return "moved";
         }
 
         const sure = await confirm({
@@ -172,8 +236,8 @@ async function fileDetailsPage(entry: VaultEntry, remoteIndex: RemoteIndex, acco
             const account = accounts.find(a => a.id === shard.accountId);
             if (!account) continue; // account no longer configured — nothing we can do remotely
 
-            const status = shardStatus(remoteIndex, shard);
-            if (status === "missing") continue; // already gone remotely
+            const shardStat = shardStatus(remoteIndex, shard);
+            if (shardStat === "missing") continue; // already gone remotely
 
             try {
                 await deleteFile({ repo: account.repo, path: shard.path, accessToken: account.token });
