@@ -14,7 +14,6 @@ import { formatBytes, logHFError, mimeFromExtension } from "../../utils/utils"
 import { readRaidMode } from "../../utils/hfconf"
 import { Encoder } from "../../cryptography/encoder"
 import { KeyVault } from "../../cryptography/key-vault"
-import { progressFetch } from "../../hf/progress-fetch"
 import { ensureVaultOpen } from "../utils/vault-access"
 import { clearScreen } from "../utils/screen"
 
@@ -133,11 +132,16 @@ export async function handleUploadProcess() {
             writeFileSync(shardTempPath, buf);
 
             try {
+                // No custom `fetch` here: bucket uploads go through Hugging
+                // Face's Xet CAS protocol (raw binary xorb POSTs), not the
+                // LFS/S3-PUT path progressFetch's body-substitution trick was
+                // built and tested for — wrapping that request body was
+                // producing a corrupted xorb server-side. commitIter still
+                // reports per-shard "uploading" progress on its own either way.
                 for await (const event of commitIter({
                     repo: assignment.account.repo,
                     accessToken: assignment.account.token,
                     title: `Upload ${blobPath}`,
-                    fetch: progressFetch as typeof fetch,
                     operations: [{
                         operation: "addOrUpdate",
                         path: blobPath,
