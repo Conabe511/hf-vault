@@ -13,6 +13,7 @@ import {
 } from "../../hf/manifest";
 import { classifyRemoteFile, fetchRemoteFiles, RemoteFile } from "../../hf/sync";
 import { findRepairCandidates, repairEntry, RepairCandidate } from "../../raid/repair";
+import { findRebalanceCandidates, rebalanceEntry, RebalanceCandidate } from "../../raid/rebalance";
 import { entryStatus, RemoteIndex } from "../../raid/status";
 import { formatBytes, logHFError } from "../../utils/utils";
 import { clearScreen } from "../utils/screen";
@@ -62,6 +63,12 @@ export async function handleSyncProcess() {
     //     now via a surviving mirror or parity — worth repairing before a
     //     second loss pushes them past what the RAID mode can cover.
     const repairable = findRepairCandidates(tracked, remoteIndex);
+
+    // 1c. Rebalanceable entries: fully healthy RAID0/RAID1/RAID6 files
+    //     that could now be spread across more accounts than they
+    //     currently are (accounts added since upload) — "grow the array"
+    //     onto the new account(s), same RAID mode, wider split.
+    const rebalanceable = findRebalanceCandidates(tracked, accounts, remoteIndex);
 
     // 2. Manifest blobs found on the remote, indexed by fileId -> where to
     //    fetch one from. This is just filename matching (fileId is opaque
@@ -149,12 +156,13 @@ export async function handleSyncProcess() {
         classifySpinner.stop("Content inspection done");
     }
 
-    const synced = tracked.length - stale.length - repairable.length;
+    const synced = tracked.length - stale.length - repairable.length - rebalanceable.length;
 
     note(
         `${color.green("●")} In sync:        ${synced} file(s)\n` +
         `${color.yellow("●")} Degraded:       ${repairable.length} file(s) (recoverable now, but missing a shard)\n` +
         `${color.red("●")} Lost:           ${stale.length} file(s) (unrecoverable on remote)\n` +
+        `${color.cyan("●")} Rebalanceable:  ${rebalanceable.length} file(s) (could use recently added account(s))\n` +
         `${color.cyan("●")} Rebuildable:    ${rebuildable.length} file(s) (remote manifest, no local record)\n` +
         `${color.yellow("●")} Foreign remote: ${classified.length} file(s) (not part of your vault)`,
         "Sync Summary"
@@ -198,6 +206,10 @@ export async function handleSyncProcess() {
 
     if (repairable.length > 0) {
         await repairDegradedFiles(repairable, accounts);
+    }
+
+    if (rebalanceable.length > 0) {
+        await rebalanceFiles(rebalanceable, accounts);
     }
 
     if (rebuildable.length > 0) {
@@ -258,6 +270,57 @@ async function repairDegradedFiles(candidates: RepairCandidate[], accounts: HFAc
     }
 
     log.success(`Repaired ${succeeded}/${candidates.length} degraded file(s).`);
+}
+
+/**
+ * Re-plans each rebalanceable file across every currently configured
+ * account, uploads the wider shard set, then retires the old one — same
+ * RAID mode throughout, just spread over more accounts. This is a real
+ * bulk operation (every candidate gets fully re-downloaded and
+ * re-uploaded), not an instant metadata change, so it's opt-in per Sync
+ * run rather than automatic.
+ */
+async function rebalanceFiles(candidates: RebalanceCandidate[], accounts: HFAccount[]) {
+    note(
+        candidates
+            .map(c => `${c.entry.name}  (${c.entry.raid.toUpperCase()}, ${c.currentShardCount} -> ${c.desiredShardCount} shard(s))`)
+            .join("\n"),
+        "Rebalanceable — could use recently added account(s)"
+    );
+
+    const proceed = await confirm({
+        message: `Rebalance these ${candidates.length} file(s) now? Each one is fully re-downloaded and re-uploaded across the wider account set.`,
+    });
+
+    if (isCancel(proceed) || !proceed) {
+        log.info("Skipped rebalancing. These files stay on their current (narrower) layout until you run Sync again.");
+        return;
+    }
+
+    // Re-uploading writes a fresh, re-encrypted manifest, same as repair
+    if (!await ensureVaultOpen()) {
+        log.warn("Vault stayed locked — rebalancing needs it to re-encrypt manifests. Nothing was rebalanced.");
+        return;
+    }
+
+    const rebalanceSpinner = spinner();
+    let succeeded = 0;
+
+    for (const candidate of candidates) {
+        rebalanceSpinner.start(`Rebalancing "${candidate.entry.name}"...`);
+
+        const result = await rebalanceEntry(candidate.entry, accounts);
+
+        if (result.ok) {
+            succeeded++;
+            rebalanceSpinner.stop(result.message);
+        }
+        else {
+            rebalanceSpinner.stop(color.red(`Rebalance failed for ${result.message}`));
+        }
+    }
+
+    log.success(`Rebalanced ${succeeded}/${candidates.length} file(s).`);
 }
 
 /**

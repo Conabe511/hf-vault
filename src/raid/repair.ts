@@ -1,10 +1,7 @@
-import { commitIter, downloadFile } from "@huggingface/hub";
-import { randomBytes } from "crypto";
-import { unlinkSync, writeFileSync } from "fs";
-import { pathToFileURL } from "url";
 import { HFDataManager, HFFileEntry, HFShard } from "../hf/actions";
 import { HFAccount } from "../hf/accounts";
 import { buildManifest, uploadManifest } from "../hf/manifest";
+import { fetchBlobBytes, uploadBlobBytes } from "./blob-io";
 import { computeParity, reconstruct } from "./parity";
 import { entryStatus, RemoteIndex, shardStatus } from "./status";
 
@@ -33,41 +30,6 @@ export function findRepairCandidates(tracked: HFFileEntry[], index: RemoteIndex)
     }
 
     return candidates;
-}
-
-async function fetchBlobBytes(account: HFAccount, path: string): Promise<Buffer | null> {
-    try {
-        const blob = await downloadFile({ repo: account.repo, path, accessToken: account.token });
-        if (!blob) return null;
-        return Buffer.from(await blob.arrayBuffer());
-    }
-    catch (e) {
-        return null;
-    }
-}
-
-async function uploadRepairedShard(account: HFAccount, bytes: Buffer): Promise<string> {
-    const path = randomBytes(16).toString("hex");
-    const tempPath = randomBytes(16).toString("hex");
-    writeFileSync(tempPath, bytes);
-
-    try {
-        // File-backed content, no custom fetch — same reasoning as the
-        // regular upload path (see upload-section.ts): an in-memory Blob
-        // and a custom progress-tracking fetch both corrupted Xet uploads.
-        for await (const _event of commitIter({
-            repo: account.repo,
-            accessToken: account.token,
-            title: `Repair ${path}`,
-            operations: [{ operation: "addOrUpdate", path, content: pathToFileURL(tempPath) }],
-        })) {
-            // repair runs silently under one spinner in the caller
-        }
-    } finally {
-        unlinkSync(tempPath);
-    }
-
-    return path;
 }
 
 /**
@@ -126,7 +88,7 @@ export async function repairEntry(candidate: RepairCandidate, accounts: HFAccoun
         }
 
         usedAccountIds.add(target.id);
-        const path = await uploadRepairedShard(target, bytes);
+        const path = await uploadBlobBytes(target, bytes, "Repair");
 
         replacements.push({ accountId: target.id, repository: target.repo, path, role: missing.role, index: missing.index });
     }

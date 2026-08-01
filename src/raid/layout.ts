@@ -1,4 +1,6 @@
 import { HFAccount } from "../hf/accounts";
+import { splitIntoShards } from "./chunk";
+import { computeParity } from "./parity";
 import { RaidMode, ShardAssignment, UploadPlan } from "./types";
 
 const MIN_ACCOUNTS: Record<RaidMode, number> = {
@@ -76,4 +78,43 @@ export function planUpload(mode: RaidMode, accounts: HFAccount[]): UploadPlan {
     }
 
     return { mode, assignments };
+}
+
+/** Slices/replicates an encrypted buffer into one Buffer per shard assignment, per RAID mode. */
+export function buildShardBuffers(
+    mode: RaidMode,
+    assignments: ShardAssignment[],
+    cipherBuffer: Buffer
+): Map<ShardAssignment, Buffer> {
+    const result = new Map<ShardAssignment, Buffer>();
+
+    if (mode === "none") {
+        result.set(assignments[0], cipherBuffer);
+        return result;
+    }
+
+    if (mode === "raid1") {
+        for (const assignment of assignments) {
+            result.set(assignment, cipherBuffer);
+        }
+        return result;
+    }
+
+    // raid0 / raid6: split across the "data" assignments, in index order
+    const dataAssignments = assignments
+        .filter(a => a.role === "data")
+        .sort((a, b) => a.index - b.index);
+
+    const dataShards = splitIntoShards(cipherBuffer, dataAssignments.length);
+    dataAssignments.forEach((assignment, i) => result.set(assignment, dataShards[i]));
+
+    if (mode === "raid6") {
+        const pAssignment = assignments.find(a => a.role === "parity-p")!;
+        const qAssignment = assignments.find(a => a.role === "parity-q")!;
+        const { p, q } = computeParity(dataShards);
+        result.set(pAssignment, p);
+        result.set(qAssignment, q);
+    }
+
+    return result;
 }

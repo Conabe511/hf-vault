@@ -45,12 +45,15 @@ your file ──> AES-256-GCM encrypt ──> RAID split/mirror ──> one blob
     down at once while still pooling most of their storage. Needs 4+ accounts.
   - If fewer accounts are configured than a mode needs at upload time,
     HF-VAULT falls back to a simpler mode automatically and says so.
-  - RAID assignment happens once, at upload time. Adding an account
-    later only affects files uploaded *after* that (a wider stripe/parity
-    split going forward) — it does **not** rebalance/re-stripe files
-    already uploaded. Sync's repair only reconstructs shards that are
-    confirmed missing; it never touches a file with no missing shards,
-    so there's no "grow the array" operation to run after adding an account.
+  - RAID assignment happens at upload time, so adding an account only
+    benefits files uploaded *after* that by default. Sync detects
+    already-uploaded files that could now be spread across more accounts
+    (same RAID mode, wider stripe/more mirrors/wider data+parity split)
+    and offers to **rebalance** them: fully re-download, re-plan across
+    every currently configured account, re-upload, then retire the old
+    shards — "grow the array" onto the new account(s). It's a real bulk
+    operation (opt-in per Sync run, not automatic), and only ever runs on
+    fully healthy files — a degraded file is repaired first.
 - **Vault folders** are purely virtual — organize files into folders from
   *List your vault files* independently of both the local filesystem they
   came from and the (still randomly-named, flat) remote blob layout.
@@ -75,10 +78,12 @@ your file ──> AES-256-GCM encrypt ──> RAID split/mirror ──> one blob
   RAID1/RAID6 files missing a shard (e.g. after removing/replacing an
   account) and offers to **repair** them — reconstructing the missing
   shard from parity/mirror and re-uploading it to restore full
-  redundancy — foreign files uploaded by other means (with an
-  encrypted-or-not content heuristic), and files a remote shard
-  **manifest** describes but that have no local record (e.g. after
-  `.hfcoll.db` was lost) — lets you import, rebuild, or delete them
+  redundancy — **rebalanceable** files that could now span more accounts
+  than they currently do (accounts added since upload) and offers to
+  **grow** them onto the wider account set, foreign files uploaded by
+  other means (with an encrypted-or-not content heuristic), and files a
+  remote shard **manifest** describes but that have no local record (e.g.
+  after `.hfcoll.db` was lost) — lets you import, rebuild, or delete them
 - Per-file remote deletion from the file list (every shard + manifest copy)
 - Master password change (re-encrypts the vault)
 - First-run guided setup
