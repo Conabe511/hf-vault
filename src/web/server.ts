@@ -74,6 +74,13 @@ async function handleUnlock(req: Request): Promise<Response> {
             return json({ error: "Wrong password" }, 401);
         }
     }
+    else if (!vault.verifyPassword(body.password)) {
+        // A CLI session (or an earlier web session) already unlocked the
+        // vault — open() would silently no-op here and accept ANY
+        // password, since it only checks isOpen(). Must verify explicitly
+        // against the vault that's already sitting open in memory.
+        return json({ error: "Wrong password" }, 401);
+    }
 
     const token = randomBytes(32).toString("hex");
     sessions.add(token);

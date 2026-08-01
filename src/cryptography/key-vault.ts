@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "crypto";
+import { createCipheriv, createDecipheriv, randomBytes, scryptSync, timingSafeEqual } from "crypto";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { ALG, generateAES256IV } from "./create-random-key";
 import { resolveAppFile } from "../utils/app-paths";
@@ -114,6 +114,19 @@ export class KeyVault {
 
     version(): number {
         return this.requireOpen().version;
+    }
+
+    /**
+     * Checks a password against the currently-open vault without touching
+     * its state — for callers (the web UI's /api/unlock) that must verify
+     * a password even when another session already opened the vault, where
+     * calling open() again would silently no-op and accept anything. False
+     * if the vault isn't open at all.
+     */
+    verifyPassword(password: string): boolean {
+        if (!this.salt || !this.passwordKey) return false;
+        const candidate = this.deriveKey(password, this.salt);
+        return candidate.length === this.passwordKey.length && timingSafeEqual(candidate, this.passwordKey);
     }
 
     addKey(id: string, key: Buffer) {
