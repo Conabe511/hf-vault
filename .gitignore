@@ -1,8 +1,22 @@
+# Dev files
 .env
 node_modules/
-*.mp4
 
+# Build files
+build/
+
+# Test files
+*.mp4
+*.pdf
+
+# Secret files
 *.hfcoll
 *.hfkey
+*.hfconf
 
+# MacOS shit
 .DS_Store
+
+# Built executable
+hfv
+dist/

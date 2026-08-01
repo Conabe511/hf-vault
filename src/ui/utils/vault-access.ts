@@ -1,4 +1,4 @@
-import { isCancel, log, password } from "@clack/prompts";
+import { isCancel, log, note, password } from "@clack/prompts";
 import { KeyVault } from "../../cryptography/key-vault";
 
 /**
@@ -14,6 +14,20 @@ export async function ensureVaultOpen(): Promise<boolean> {
     }
 
     const firstRun = !vault.exists();
+
+    if (firstRun) {
+        const keyFileName = process.env.APP_KEY_FILE ?? ".hfkey";
+
+        note(
+            `This is the first file you're adding. HF-VAULT will create a\n` +
+            `secure key file (${keyFileName}) that maps the AES keys used to\n` +
+            `decrypt each of your files.\n\n` +
+            `The master password you choose now is what protects that file.\n\n` +
+            `⚠  Choose it wisely and don't forget it — without it your\n` +
+            `   files cannot be recovered. There is no reset.`,
+            "Create a Master Password"
+        );
+    }
 
     while (true) {
         const psw = await password({

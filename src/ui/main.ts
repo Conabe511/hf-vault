@@ -7,8 +7,15 @@ import { handleDownloadProcess } from "./data/download-section";
 import { handleListFiles } from "./data/list-files";
 import { handleSyncProcess } from "./data/sync-section";
 import { clearScreen, pressEnterToContinue } from "./utils/screen";
+import { configurationPage } from "./settings/configuration/configuration";
 
 export async function start() {
+    // The app is unusable without a token and a repository: when either is
+    // missing (fresh install, no .env / .hfconf) run the setup first
+    if (!process.env.HF_TOKEN || !process.env.HF_REPO) {
+        await configurationPage(true);
+    }
+
     while (true) {
         clearScreen();
         intro(color.bgMagenta(" Welcome to HF-VAULT "))

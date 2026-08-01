@@ -1,9 +1,11 @@
-import { intro, isCancel, log, note, select, spinner } from "@clack/prompts";
-import { listFiles } from "@huggingface/hub";
+import { confirm, intro, isCancel, log, note, select, spinner } from "@clack/prompts";
+import { deleteFile, listFiles } from "@huggingface/hub";
 import color from "picocolors";
 import { HFDataManager } from "../../hf/actions";
-import { formatBytes } from "../../utils/utils";
-import { clearScreen } from "../utils/screen";
+import { formatBytes, logHFError } from "../../utils/utils";
+import { clearScreen, pressEnterToContinue } from "../utils/screen";
+
+type VaultEntry = ReturnType<HFDataManager["getFiles"]>[number];
 
 // repo name -> paths that actually exist on the remote,
 // or "unreachable" when the repo couldn't be listed
@@ -39,13 +41,6 @@ async function fetchRemoteIndex(repos: string[]): Promise<{ index: RemoteIndex; 
     return { index, usedBytes };
 }
 
-function formatUsage(usedBytes: number): string {
-    const pct = (usedBytes / STORAGE_TOTAL_BYTES) * 100;
-    const pctLabel = pct > 0 && pct < 1 ? "<1%" : `${pct.toFixed(0)}%`;
-
-    return `☁  ${formatBytes(usedBytes)} used of ${formatBytes(STORAGE_TOTAL_BYTES)} (${pctLabel})`;
-}
-
 function remoteStatus(index: RemoteIndex, repo: string, path: string): "synced" | "missing" | "unknown" {
     const paths = index.get(repo);
 
@@ -59,14 +54,34 @@ const STATUS_ICON = {
     unknown: color.yellow("●"),
 } as const;
 
+function formatUsage(usedBytes: number): string {
+    const pct = (usedBytes / STORAGE_TOTAL_BYTES) * 100;
+    const pctLabel = pct > 0 && pct < 1 ? "<1%" : `${pct.toFixed(0)}%`;
+
+    return `☁  ${formatBytes(usedBytes)} used of ${formatBytes(STORAGE_TOTAL_BYTES)} (${pctLabel})`;
+}
+
+// Hold the screen with a Back option — a bare log line would be wiped
+// instantly by the main menu redrawing over it
+async function showEmptyVault() {
+    log.warn("No files in the vault");
+
+    await select({
+        message: "Nothing to list yet — upload a file first.",
+        options: [
+            { value: "back", label: color.dim("← Back") },
+        ],
+    });
+}
+
 export async function handleListFiles() {
     clearScreen();
     intro("Your Vault Files");
 
-    const files = HFDataManager.getInstance().getFiles();
+    const files = [...HFDataManager.getInstance().getFiles()];
 
     if (files.length === 0) {
-        log.warn("No files in your vault yet.");
+        await showEmptyVault();
         return;
     }
 
@@ -76,11 +91,10 @@ export async function handleListFiles() {
     const { index: remoteIndex, usedBytes } = await fetchRemoteIndex(repos);
     remoteSpinner.stop("Remote status loaded");
 
-    // Browse loop, redrawn in place: every iteration clears the screen and
-    // re-renders header + legend + (details of the last picked file) + list,
-    // so the menu stays fixed instead of stacking down the terminal
-    let selected: ReturnType<typeof files.find> = undefined;
+    let bytesShown = usedBytes;
 
+    // Browse loop, redrawn in place: list -> details page of the picked
+    // file (with its actions) -> back to the list
     while (true) {
         clearScreen();
         intro("Your Vault Files");
@@ -91,22 +105,7 @@ export async function handleListFiles() {
             `${STATUS_ICON.unknown} repo unreachable`
         );
 
-        log.info(color.cyan(formatUsage(usedBytes)));
-
-        if (selected) {
-            const status = remoteStatus(remoteIndex, selected.repository, selected.path);
-
-            note(
-                `Name:        ${selected.name}\n` +
-                `Size:        ${formatBytes(selected.size)}\n` +
-                `Type:        ${selected.mime}\n` +
-                `Uploaded:    ${new Date(selected.createdAt).toLocaleString()}\n` +
-                `Repository:  ${selected.repository}\n` +
-                `Remote name: ${selected.path}\n` +
-                `Remote:      ${STATUS_ICON[status]} ${status}`,
-                "File Details"
-            );
-        }
+        log.info(color.cyan(formatUsage(bytesShown)));
 
         const choice = await select({
             message: `${files.length} file(s) in your vault — select one for details:`,
@@ -127,6 +126,101 @@ export async function handleListFiles() {
             return;
         }
 
-        selected = files.find(f => f.id === choice);
+        const entry = files.find(f => f.id === choice);
+        if (!entry) continue;
+
+        const outcome = await fileDetailsPage(entry, remoteIndex);
+
+        if (outcome === "deleted") {
+            files.splice(files.indexOf(entry), 1);
+
+            // keep the status dots and the usage counter truthful
+            const paths = remoteIndex.get(entry.repository);
+            if (paths && paths !== "unreachable" && paths.delete(entry.path)) {
+                bytesShown -= entry.size;
+            }
+
+            if (files.length === 0) {
+                clearScreen();
+                intro("Your Vault Files");
+                await showEmptyVault();
+                return;
+            }
+        }
+    }
+}
+
+async function fileDetailsPage(entry: VaultEntry, remoteIndex: RemoteIndex): Promise<"back" | "deleted"> {
+    while (true) {
+        clearScreen();
+        intro("File Details");
+
+        const status = remoteStatus(remoteIndex, entry.repository, entry.path);
+
+        note(
+            `Name:        ${entry.name}\n` +
+            `Size:        ${formatBytes(entry.size)}\n` +
+            `Type:        ${entry.mime}\n` +
+            `Uploaded:    ${new Date(entry.createdAt).toLocaleString()}\n` +
+            `Repository:  ${entry.repository}\n` +
+            `Remote name: ${entry.path}\n` +
+            `Remote:      ${STATUS_ICON[status]} ${status}`,
+            "File Details"
+        );
+
+        // Back listed first: an accidental double-Enter from the list
+        // must never land on the destructive option
+        const action = await select({
+            message: "What do you want to do?",
+            options: [
+                { value: "back", label: color.dim("← Back to the list") },
+                { value: "delete", label: "Delete this file", hint: "removes it from the remote and stops tracking it" },
+            ],
+        });
+
+        if (isCancel(action) || action === "back") {
+            return "back";
+        }
+
+        const token = process.env.HF_TOKEN;
+        if (!token) {
+            log.error("HF_TOKEN is not configured — cannot delete remote files.");
+            await pressEnterToContinue();
+            continue;
+        }
+
+        const sure = await confirm({
+            message: `Permanently delete "${entry.name}" from ${entry.repository} and stop tracking it?`,
+        });
+
+        if (isCancel(sure) || !sure) {
+            continue;
+        }
+
+        // Already gone remotely (stale entry)? Then there is nothing to
+        // delete on HF — just stop tracking it locally.
+        if (status !== "missing") {
+            try {
+                await deleteFile({
+                    repo: entry.repository,
+                    path: entry.path,
+                    accessToken: token,
+                });
+            }
+            catch (e) {
+                logHFError(e);
+                log.warn("Remote deletion failed — keeping the local entry so nothing gets lost.");
+                await pressEnterToContinue();
+                continue;
+            }
+        }
+
+        HFDataManager.getInstance().removeFile(entry.id);
+
+        // The decryption key stays in the vault on purpose: harmless, and
+        // still useful if the user happens to keep a copy of the encrypted blob
+        log.success(`Deleted "${entry.name}".`);
+        await pressEnterToContinue();
+        return "deleted";
     }
 }

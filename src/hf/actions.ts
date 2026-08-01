@@ -2,6 +2,7 @@ import { createRepo, repoExists, uploadFile } from "@huggingface/hub"
 import { HFVInvalidToken, HFVRepoNotFound, HFVInvalidName } from './errors'
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { basename, extname } from "node:path"
+import { resolveAppFile } from "../utils/app-paths"
 
 export async function createHFRepo(name: string) {
 
@@ -52,7 +53,7 @@ export async function uploadFileToHF(file: File, to: string) {
 
 const HF_REPO_TYPE_PREFIXES = ["spaces", "datasets", "models"];
 
-function isHFNameValid(name: string): boolean {
+export function isHFNameValid(name: string): boolean {
     const parts = name.split('/');
     // valid: "user/repo" (2 parts, implicit model repo)
     // or "spaces|datasets|models/user/repo" (3 parts, explicit repo type)
@@ -100,7 +101,7 @@ export class HFDataManager {
     private collection?: HFCollection;
 
     private constructor(path = ".hfcoll") {
-        this.collectionPath = path;
+        this.collectionPath = resolveAppFile(path);
     }
 
     static getInstance(): HFDataManager {

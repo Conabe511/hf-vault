@@ -4,7 +4,18 @@
   "description": "",
   "main": "src/index.ts",
   "scripts": {
-    "start": "tsx src/index.ts"
+    "start": "tsx src/index.ts",
+    "build": "esbuild src/index.ts --bundle --platform=node --outfile=build/app.js \"--banner:js=#!/usr/bin/env node\"",
+    "release-macos": "bun build ./build/app.js --compile --outfile hfv && codesign --remove-signature hfv && codesign --sign - --force hfv",
+    "release-macos-intel": "bun build ./build/app.js --compile --target=bun-darwin-x64 --outfile dist/hfv-macos-x64",
+    "release-linux": "bun build ./build/app.js --compile --target=bun-linux-x64 --outfile dist/hfv-linux-x64",
+    "release-linux-arm": "bun build ./build/app.js --compile --target=bun-linux-arm64 --outfile dist/hfv-linux-arm64",
+    "release-win": "bun build ./build/app.js --compile --target=bun-windows-x64 --outfile dist/hfv-windows-x64.exe",
+    "release-all": "yarn release-macos && yarn release-macos-intel && yarn release-linux && yarn release-linux-arm && yarn release-win",
+    "integrate": "cp hfv ~/.bun/bin/"
+  },
+  "bin": {
+    "hfv": "build/app.js"
   },
   "keywords": [],
   "author": "",
@@ -13,6 +24,7 @@
   "devDependencies": {
     "@clack/prompts": "^1.7.0",
     "@types/node": "^26.1.1",
+    "pkg": "^5.8.1",
     "tsx": "^4.23.1",
     "typescript": "^7.0.2"
   },

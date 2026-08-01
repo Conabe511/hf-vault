@@ -1,5 +1,4 @@
-import { config } from 'dotenv'
-config();
+import './env-setup';
 
 import { start } from './ui/main';
 

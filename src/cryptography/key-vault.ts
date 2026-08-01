@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, randomBytes, scryptSync } from "crypto";
 import { existsSync, readFileSync, writeFileSync } from "fs";
 import { ALG, generateAES256IV } from "./create-random-key";
+import { resolveAppFile } from "../utils/app-paths";
 
 export interface KeyVaultData {
     version: number;
@@ -30,13 +31,18 @@ const SALT_BYTES = 16;
 export class KeyVault {
     private static instance: KeyVault;
 
-    private path: string;
     private passwordKey?: Buffer;
     private salt?: Buffer;
     private data?: KeyVaultData;
 
-    private constructor() {
-        this.path = process.env.APP_KEY_FILE ?? ".hfkey";
+    private constructor() { }
+
+    // Resolved lazily on every access: APP_KEY_FILE can be changed at
+    // runtime from the configuration page, and a close()d vault must
+    // reopen against the new location. Bare names live in the OS
+    // app-data folder; an absolute path is respected as-is.
+    private get path(): string {
+        return resolveAppFile(process.env.APP_KEY_FILE ?? ".hfkey");
     }
 
     static getInstance(): KeyVault {
