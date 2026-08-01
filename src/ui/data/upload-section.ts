@@ -2,6 +2,7 @@ import { intro, isCancel, cancel, note, spinner, path, log, confirm, progress } 
 import { commitIter, deleteFile, repoExists } from "@huggingface/hub"
 import { randomBytes } from "crypto"
 import { readFileSync, unlinkSync, writeFileSync } from "fs"
+import { extname } from "node:path"
 import { pathToFileURL } from "url"
 import { inspectFile, createHFRepo, HFDataManager, HFFileEntry, HFShard } from "../../hf/actions"
 import { HFAccount, resolveAccounts } from "../../hf/accounts"
@@ -131,13 +132,19 @@ export async function prepareUploadPlan(): Promise<PreparedUploadPlan | null> {
 export async function uploadOneFile(
     filePathStr: string,
     folder: string,
-    { mode, plan, uniqueAccounts }: PreparedUploadPlan
+    { mode, plan, uniqueAccounts }: PreparedUploadPlan,
+    // Overrides the tracked name/mime — for callers whose local path is a
+    // throwaway temp file, not the file's real name (e.g. upload-from-URL,
+    // where filePathStr is just where the download landed).
+    nameOverride?: string
 ): Promise<{ ok: true; fileId: string } | { ok: false }> {
     const metadata = await inspectFile(filePathStr);
+    const name = nameOverride ?? metadata.name;
+    const mime = mimeFromExtension(nameOverride ? extname(nameOverride) : metadata.extension);
 
     // Encrypt — spinner since it's local I/O and fast relative to upload
     const encSpinner = spinner();
-    encSpinner.start(`Encrypting ${metadata.name}...`);
+    encSpinner.start(`Encrypting ${name}...`);
     const fileId = randomBytes(16).toString("hex");
     const encoder = Encoder.forNewFile(fileId);
     const tempCipherPath = randomBytes(16).toString("hex");
@@ -151,7 +158,7 @@ export async function uploadOneFile(
     const totalBytes = [...shardBuffers.values()].reduce((sum, b) => sum + b.length, 0);
 
     const uploadProgress = progress({ max: 100 });
-    uploadProgress.start(`Preparing upload of ${metadata.name}...`);
+    uploadProgress.start(`Preparing upload of ${name}...`);
 
     // Same monotonic advance() trick as a single-shard upload, just scaled
     // to give each shard a slice of the 0-100 bar proportional to its size
@@ -243,7 +250,7 @@ export async function uploadOneFile(
     }
 
     advanceTo(100, "Upload complete");
-    uploadProgress.stop(`Uploaded ${metadata.name} — ${formatBytes(totalBytes)} across ${shardEntries.length} shard(s)`);
+    uploadProgress.stop(`Uploaded ${name} — ${formatBytes(totalBytes)} across ${shardEntries.length} shard(s)`);
 
     const shards: HFShard[] = uploaded.map(({ assignment, path: blobPath }) => ({
         accountId: assignment.account.id,
@@ -272,9 +279,9 @@ export async function uploadOneFile(
 
     const entry: HFFileEntry = {
         id: fileId,
-        name: metadata.name,
+        name,
         size: metadata.size,
-        mime: mimeFromExtension(metadata.extension),
+        mime,
         createdAt: metadata.createdAt.toISOString(),
         iv: encoder.getIV().toString("hex"),
         tag: encoder.getAuthTag().toString("hex"),

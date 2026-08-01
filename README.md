@@ -65,6 +65,13 @@ your file ──> AES-256-GCM encrypt ──> RAID split/mirror ──> one blob
 ## Features
 
 - Upload with encryption, download with decryption — with real progress bars
+- **Upload from a URL** — fetches a file straight from a direct link (e.g.
+  a [Copyparty](https://github.com/9001/copyparty) share on another
+  machine) and uploads it, so the machine running HF-VAULT doesn't need
+  to permanently hold a full local copy of a file that's already sitting
+  on another machine. The download still touches local disk as a temp
+  file (streamed, not buffered in memory), but it's deleted immediately
+  after encryption
 - Recursive folder upload, mirroring a local directory's subfolder
   structure into a chosen vault folder; single-file uploads can also be
   filed into a vault folder directly. Vault folders are a virtual
