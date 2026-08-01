@@ -1,4 +1,5 @@
 import { listFiles } from "@huggingface/hub";
+import { HFAccount } from "./accounts";
 
 export interface RemoteFile {
     path: string;
@@ -6,15 +7,15 @@ export interface RemoteFile {
 }
 
 /**
- * Lists the files of one repo, or null when the repo can't be reached
+ * Lists the files of one account's repo, or null when it can't be reached
  * (deleted, private, offline...). Unreachable is deliberately distinct from
  * empty: sync must never treat "couldn't check" as "files are gone".
  */
-export async function fetchRemoteFiles(repo: string): Promise<RemoteFile[] | null> {
+export async function fetchRemoteFiles(account: HFAccount): Promise<RemoteFile[] | null> {
     try {
         const files: RemoteFile[] = [];
 
-        for await (const entry of listFiles({ repo, accessToken: process.env.HF_TOKEN })) {
+        for await (const entry of listFiles({ repo: account.repo, accessToken: account.token })) {
             if (entry.type === "file") {
                 files.push({ path: entry.path, size: entry.size });
             }
@@ -88,12 +89,12 @@ function shannonEntropy(buf: Buffer): number {
  * whether it's encrypted. Heuristic: known format signature or mostly-text
  * content -> plain; otherwise high entropy -> encrypted.
  */
-export async function classifyRemoteFile(repo: string, path: string): Promise<RemoteContentKind> {
-    const url = `https://huggingface.co/${repo}/resolve/main/${path}`;
+export async function classifyRemoteFile(account: HFAccount, path: string): Promise<RemoteContentKind> {
+    const url = `https://huggingface.co/${account.repo}/resolve/main/${path}`;
 
     const response = await fetch(url, {
         headers: {
-            Authorization: `Bearer ${process.env.HF_TOKEN}`,
+            Authorization: `Bearer ${account.token}`,
             Range: "bytes=0-4095",
         },
     });

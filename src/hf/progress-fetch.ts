@@ -79,7 +79,15 @@ function countingBlobLike(blob: Blob, onBytes: (loaded: number) => void) {
     };
 }
 
-export const progressFetch: typeof fetch = async (input, init) => {
+// Typed as a plain function rather than `typeof fetch`: Bun augments the
+// global fetch with a static `preconnect` method that a plain async
+// function can't structurally satisfy. Callers that need a `typeof fetch`
+// (e.g. commitIter's `fetch` option) cast at the call site — this
+// function is never invoked as fetch.preconnect(), so it's a type-only gap.
+export const progressFetch = async (
+    input: Parameters<typeof fetch>[0],
+    init: Parameters<typeof fetch>[1]
+): Promise<Response> => {
     const hint = (init as { progressHint?: ProgressHint } | undefined)?.progressHint;
 
     if (!init || !hint || (init.method !== "PUT" && init.method !== "POST")) {

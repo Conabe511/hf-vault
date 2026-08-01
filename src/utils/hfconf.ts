@@ -2,6 +2,21 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolveAppFile } from "./app-paths";
 
 /**
+ * An additional Hugging Face account used to pool/replicate storage
+ * beyond the primary HF_TOKEN/HF_REPO. Kept here (rather than in
+ * src/hf/accounts.ts) so this low-level config module has no dependency
+ * on the higher-level account registry — accounts.ts imports this type.
+ */
+export interface HFAccount {
+    id: string;
+    label: string;
+    token: string;
+    repo: string;
+}
+
+export type RaidMode = "none" | "raid0" | "raid1" | "raid6";
+
+/**
  * Runtime configuration, stored as JSON in .hfconf inside the app-data
  * folder. This is the installed-app counterpart of the developer .env:
  * same keys, but editable from inside the app (Settings -> Configuration)
@@ -12,9 +27,17 @@ export interface HFConfig {
     HF_TOKEN?: string;
     HF_REPO?: string;
     APP_KEY_FILE?: string;
+    // JSON-encoded HFAccount[] — see readAccounts()/saveAccounts() below.
+    // Named to match its .env counterpart (HF_ACCOUNTS) so it flows
+    // through the same generic string read/save/process.env machinery as
+    // every other config key, no special-casing needed there.
+    HF_ACCOUNTS?: string;
+    // Stored as a plain string (like every other config key) — readRaidMode()
+    // is what narrows it to a real RaidMode, defaulting invalid/missing to "none".
+    RAID_MODE?: string;
 }
 
-export const CONFIG_KEYS = ["HF_TOKEN", "HF_REPO", "APP_KEY_FILE"] as const;
+export const CONFIG_KEYS = ["HF_TOKEN", "HF_REPO", "APP_KEY_FILE", "HF_ACCOUNTS", "RAID_MODE"] as const;
 
 export function hfconfPath(): string {
     return resolveAppFile(".hfconf");
@@ -72,4 +95,32 @@ export function saveHFConfig(update: HFConfig) {
             process.env[key] = conf[key];
         }
     }
+}
+
+/**
+ * Parses the extra-accounts list out of process.env.HF_ACCOUNTS (set
+ * from either .env or .hfconf by applyHFConfig()). Malformed JSON is
+ * treated as "no extra accounts" rather than crashing the app.
+ */
+export function readExtraAccounts(): HFAccount[] {
+    const raw = process.env.HF_ACCOUNTS;
+    if (!raw) return [];
+
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+    }
+    catch (e) {
+        return [];
+    }
+}
+
+/** Persists the extra-accounts list to .hfconf (dev .env is read-only to the app). */
+export function saveExtraAccounts(accounts: HFAccount[]) {
+    saveHFConfig({ HF_ACCOUNTS: JSON.stringify(accounts) });
+}
+
+export function readRaidMode(): RaidMode {
+    const mode = process.env.RAID_MODE;
+    return mode === "raid0" || mode === "raid1" || mode === "raid6" ? mode : "none";
 }
