@@ -12,6 +12,7 @@ import {
     isManifestPath,
 } from "../../hf/manifest";
 import { classifyRemoteFile, fetchRemoteFiles, RemoteFile } from "../../hf/sync";
+import { findRepairCandidates, repairEntry, RepairCandidate } from "../../raid/repair";
 import { entryStatus, RemoteIndex } from "../../raid/status";
 import { formatBytes, logHFError } from "../../utils/utils";
 import { clearScreen } from "../utils/screen";
@@ -56,9 +57,16 @@ export async function handleSyncProcess() {
     //    shard that could cover for the missing one(s) is also gone.
     const stale = tracked.filter(entry => entryStatus(remoteIndex, entry) === "lost");
 
-    // 2. Manifests found on the remote: the map of every file the remote
-    //    itself claims to know about, one entry per fileId (first copy found).
-    const manifestsById = new Map<string, HFManifest>();
+    // 1b. Degraded entries: RAID1/RAID6 files missing a shard (e.g. an
+    //     account was removed/replaced) but still fully recoverable right
+    //     now via a surviving mirror or parity — worth repairing before a
+    //     second loss pushes them past what the RAID mode can cover.
+    const repairable = findRepairCandidates(tracked, remoteIndex);
+
+    // 2. Manifest blobs found on the remote, indexed by fileId -> where to
+    //    fetch one from. This is just filename matching (fileId is opaque
+    //    hex, same as any other blob name) — no decryption yet.
+    const manifestLocations = new Map<string, HFAccount[]>();
     for (const account of accounts) {
         const files = remote.get(account.id);
         if (!files) continue;
@@ -66,16 +74,36 @@ export async function handleSyncProcess() {
         for (const file of files) {
             if (!isManifestPath(file.path)) continue;
             const fileId = fileIdFromManifestPath(file.path);
-            if (manifestsById.has(fileId)) continue;
-
-            const manifest = await fetchManifest(account, fileId);
-            if (manifest) manifestsById.set(fileId, manifest);
+            const locations = manifestLocations.get(fileId) ?? [];
+            locations.push(account);
+            manifestLocations.set(fileId, locations);
         }
     }
 
-    // Files the remote describes but that aren't tracked locally at all —
-    // candidates for "rebuild from manifest" rather than plain import
-    const rebuildable = [...manifestsById.values()].filter(m => !tracked.some(t => t.id === m.id));
+    // Only fileIds NOT already tracked locally are worth decrypting — for
+    // tracked entries .hfcoll already has their shard layout. Manifests
+    // are encrypted with each file's own AES key, so reading one now
+    // needs the vault open, same as decrypting the file itself would.
+    const untrackedManifestIds = [...manifestLocations.keys()].filter(id => !tracked.some(t => t.id === id));
+
+    const rebuildable: HFManifest[] = [];
+
+    if (untrackedManifestIds.length > 0) {
+        if (!await ensureVaultOpen()) {
+            log.info(`${untrackedManifestIds.length} untracked remote manifest(s) found, but the vault is locked — unlock it (run Sync again) to inspect/rebuild them.`);
+        }
+        else {
+            for (const fileId of untrackedManifestIds) {
+                for (const account of manifestLocations.get(fileId)!) {
+                    const manifest = await fetchManifest(account, fileId);
+                    if (manifest) {
+                        rebuildable.push(manifest);
+                        break;
+                    }
+                }
+            }
+        }
+    }
 
     // 3. Foreign files: on the remote, not a manifest, not a shard of any
     //    tracked entry, and not referenced by ANY manifest (tracked or not)
@@ -84,7 +112,7 @@ export async function handleSyncProcess() {
         tracked.flatMap(entry => entry.shards.map(s => `${s.accountId}:${s.path}`))
     );
     const manifestReferencedPaths = new Set(
-        [...manifestsById.values()].flatMap(m => m.shards.map(s => `${s.accountId}:${s.path}`))
+        rebuildable.flatMap(m => m.shards.map(s => `${s.accountId}:${s.path}`))
     );
 
     const foreign: { account: HFAccount; file: RemoteFile }[] = [];
@@ -121,13 +149,14 @@ export async function handleSyncProcess() {
         classifySpinner.stop("Content inspection done");
     }
 
-    const synced = tracked.length - stale.length;
+    const synced = tracked.length - stale.length - repairable.length;
 
     note(
-        `${color.green("●")} In sync / recoverable: ${synced} file(s)\n` +
-        `${color.red("●")} Lost:                  ${stale.length} file(s) (unrecoverable on remote)\n` +
-        `${color.cyan("●")} Rebuildable:            ${rebuildable.length} file(s) (remote manifest, no local record)\n` +
-        `${color.yellow("●")} Foreign remote:         ${classified.length} file(s) (not part of your vault)`,
+        `${color.green("●")} In sync:        ${synced} file(s)\n` +
+        `${color.yellow("●")} Degraded:       ${repairable.length} file(s) (recoverable now, but missing a shard)\n` +
+        `${color.red("●")} Lost:           ${stale.length} file(s) (unrecoverable on remote)\n` +
+        `${color.cyan("●")} Rebuildable:    ${rebuildable.length} file(s) (remote manifest, no local record)\n` +
+        `${color.yellow("●")} Foreign remote: ${classified.length} file(s) (not part of your vault)`,
         "Sync Summary"
     );
 
@@ -167,6 +196,10 @@ export async function handleSyncProcess() {
         }
     }
 
+    if (repairable.length > 0) {
+        await repairDegradedFiles(repairable, accounts);
+    }
+
     if (rebuildable.length > 0) {
         await manageRebuildableFiles(rebuildable);
     }
@@ -174,6 +207,57 @@ export async function handleSyncProcess() {
     if (classified.length > 0) {
         await manageForeignFiles(classified);
     }
+}
+
+/**
+ * Reconstructs and re-uploads each degraded file's missing shard(s),
+ * restoring full RAID redundancy. Repaired shards land back on the same
+ * account if it's still configured, or on any other configured account
+ * not already holding a shard for that file otherwise — no per-file
+ * prompting, matching how RAID mode selection already works elsewhere.
+ */
+async function repairDegradedFiles(candidates: RepairCandidate[], accounts: HFAccount[]) {
+    note(
+        candidates
+            .map(c => `${c.entry.name}  (${c.entry.raid.toUpperCase()}, missing ${c.missingShards.length} of ${c.entry.shards.length} shard(s))`)
+            .join("\n"),
+        "Degraded — recoverable now, but worth repairing"
+    );
+
+    const proceed = await confirm({
+        message: `Repair these ${candidates.length} file(s) now? Each missing shard is rebuilt from parity/mirror and re-uploaded.`,
+    });
+
+    if (isCancel(proceed) || !proceed) {
+        log.info("Skipped repair. These files stay degraded until you run Sync again.");
+        return;
+    }
+
+    // The refreshed manifest each repair writes is encrypted with the
+    // file's AES key, so the vault has to be open before repairing anything.
+    if (!await ensureVaultOpen()) {
+        log.warn("Vault stayed locked — repair needs it to re-encrypt manifests. Nothing was repaired.");
+        return;
+    }
+
+    const repairSpinner = spinner();
+    let succeeded = 0;
+
+    for (const candidate of candidates) {
+        repairSpinner.start(`Repairing "${candidate.entry.name}"...`);
+
+        const result = await repairEntry(candidate, accounts);
+
+        if (result.ok) {
+            succeeded++;
+            repairSpinner.stop(result.message);
+        }
+        else {
+            repairSpinner.stop(color.red(`Repair failed for ${result.message}`));
+        }
+    }
+
+    log.success(`Repaired ${succeeded}/${candidates.length} degraded file(s).`);
 }
 
 /**
@@ -230,13 +314,9 @@ async function manageRebuildableFiles(manifests: HFManifest[]) {
             shards: manifest.shards,
         });
 
-        const hasKey = KeyVault.getInstance().isOpen() && KeyVault.getInstance().hasKey(manifest.id);
-
-        log.success(
-            hasKey
-                ? `Rebuilt "${manifest.id}" — its AES key is already in your vault, so it can be downloaded now.`
-                : `Rebuilt "${manifest.id}" — but no AES key is in your vault for it yet, so it can't be decrypted until one is added.`
-        );
+        // Its manifest only decrypted (see the caller) because the vault
+        // already had this file's AES key, so it's guaranteed downloadable now.
+        log.success(`Rebuilt "${manifest.id}" — its AES key is already in your vault, so it can be downloaded now.`);
 
         remaining.splice(remaining.indexOf(manifest), 1);
     }

@@ -283,4 +283,22 @@ export class HFDataManager {
         // ON DELETE CASCADE (foreign_keys pragma is on) takes the shards with it
         this.db.run("DELETE FROM files WHERE id = ?", [id]);
     }
+
+    /** Replaces a file's entire shard list — used by repair to swap in a freshly re-uploaded shard. */
+    setShards(id: string, shards: HFShard[]) {
+        const deleteShards = this.db.prepare(`DELETE FROM shards WHERE file_id = ?`);
+        const insertShard = this.db.prepare(
+            `INSERT INTO shards (file_id, account_id, repository, path, role, shard_index)
+             VALUES (?, ?, ?, ?, ?, ?)`
+        );
+
+        const tx = this.db.transaction((fileId: string, list: HFShard[]) => {
+            deleteShards.run(fileId);
+            for (const s of list) {
+                insertShard.run(fileId, s.accountId, s.repository, s.path, s.role, s.index);
+            }
+        });
+
+        tx(id, shards);
+    }
 }

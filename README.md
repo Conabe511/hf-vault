@@ -21,7 +21,7 @@ private ones (100GB) — hence the `HF_STORAGE_TOTAL_TB` default below.
 ```
 your file ──> AES-256-GCM encrypt ──> RAID split/mirror ──> one blob per shard, per HF account
                      │                        │
-                     └─ per-file key          └─ shard manifest (topology only) replicated alongside
+                     └─ per-file key          └─ encrypted shard manifest, replicated alongside
                         ──> key vault (.hfkey)
                                │
                                └─ encrypted with your master password
@@ -54,11 +54,14 @@ your file ──> AES-256-GCM encrypt ──> RAID split/mirror ──> one blob
 - Multi-account RAID0/RAID1/RAID6 storage pooling and redundancy
 - File list with live, shard-aware remote status (synced / degraded /
   lost / unknown) and storage usage across every configured account
-- Synchronization: detects unrecoverable local entries, foreign files
-  uploaded by other means (with an encrypted-or-not content heuristic),
-  and files a remote shard **manifest** describes but that have no local
-  record (e.g. after `.hfcoll.db` was lost) — lets you import, rebuild, or
-  delete them
+- Synchronization: detects unrecoverable local entries, **degraded**
+  RAID1/RAID6 files missing a shard (e.g. after removing/replacing an
+  account) and offers to **repair** them — reconstructing the missing
+  shard from parity/mirror and re-uploading it to restore full
+  redundancy — foreign files uploaded by other means (with an
+  encrypted-or-not content heuristic), and files a remote shard
+  **manifest** describes but that have no local record (e.g. after
+  `.hfcoll.db` was lost) — lets you import, rebuild, or delete them
 - Per-file remote deletion from the file list (every shard + manifest copy)
 - Master password change (re-encrypts the vault)
 - First-run guided setup
@@ -143,15 +146,20 @@ no signing.
   from the master password via scrypt with a per-vault random salt. A wrong
   password fails authentication — there is nothing to "guess against"
   offline except the password itself, so choose a strong one.
-- IVs and auth tags are not secrets; AES-GCM security rests entirely on
-  the keys. They're kept in `.hfcoll.db` locally, and are also written to
-  each file's remote shard **manifest** (`<fileId>.hfmanifest.json`) —
-  deliberately, so a file can be recovered even if `.hfcoll.db` is lost,
-  as long as its AES key is still in `.hfkey`.
+- IVs and auth tags are not secrets on their own; AES-GCM security rests
+  entirely on the keys. They're kept in `.hfcoll.db` locally, and are also
+  written into each file's remote shard **manifest** (`<fileId>.hfmanifest`)
+  — deliberately, so a file can be recovered even if `.hfcoll.db` is lost,
+  as long as its AES key is still in `.hfkey`. The manifest itself is
+  encrypted with that same per-file AES key before upload (fresh random IV,
+  `[iv][ciphertext][tag]`) — not because the iv/tag inside are secret, but
+  because the manifest also lists which *other* accounts/buckets hold the
+  rest of that file's shards, which would otherwise be a much bigger leak
+  than an opaque blob name, especially since buckets are public.
 - What a repo visitor CAN see: how many files/shards you store, their
-  approximate sizes and upload times, and — via a manifest — how a given
-  file's shards are laid out across your accounts. What they can't: real
-  names, types, or content.
+  approximate sizes, upload times, and the presence of a `.hfmanifest`
+  blob per file — never what's inside it. What they can't see: real names,
+  types, content, or which other accounts/buckets a file spans.
 - `.hfconf` contains your HF token(s) in plaintext (like any CLI
   credential file, e.g. `~/.aws/credentials`) and is written with `600`
   permissions.

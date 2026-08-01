@@ -72,16 +72,24 @@ export function entryStatus(index: RemoteIndex, entry: HFFileEntry): EntryStatus
         return "unknown";
     }
 
-    // raid6
-    const missing = dataStatuses.filter(s => s === "missing").length;
-    const unknown = dataStatuses.filter(s => s === "unknown").length;
-
-    if (missing === 0 && unknown === 0) return "synced";
-    if (missing > 2) return "lost";
-    if (missing + unknown > 2) return "unknown"; // can't rule out > 2 gone
-
+    // raid6: data and parity shards are interchangeable redundancy units —
+    // any 2 losses anywhere among the D+2 members still leave the D data
+    // shards fully reconstructible (that's the defining property of
+    // RAID6/Reed-Solomon dual parity), regardless of whether the losses
+    // land on data or parity. So the loss count alone (not which role it
+    // hit) determines recoverability; unlike the old version of this
+    // function, losing only parity (data untouched) is still surfaced as
+    // "degraded" rather than silently "synced", since the safety margin
+    // for a *future* loss has shrunk even though nothing is unreadable yet.
     const parityShards = entry.shards.filter(s => s.role === "parity-p" || s.role === "parity-q");
     const parityStatuses = parityShards.map(s => shardStatus(index, s));
 
-    return parityStatuses.every(s => s === "synced") ? "degraded" : "unknown";
+    const allStatuses = [...dataStatuses, ...parityStatuses];
+    const missing = allStatuses.filter(s => s === "missing").length;
+    const unknown = allStatuses.filter(s => s === "unknown").length;
+
+    if (missing === 0 && unknown === 0) return "synced";
+    if (missing > 2) return "lost";
+    if (missing + unknown > 2) return "unknown"; // could still tip past the 2-loss tolerance
+    return "degraded";
 }
