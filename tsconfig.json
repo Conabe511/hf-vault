@@ -9,5 +9,6 @@
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true
-  }
+  },
+  "exclude": ["workers", "node_modules", "build"]
 }

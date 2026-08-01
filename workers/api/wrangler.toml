@@ -1,0 +1,16 @@
+name = "hf-vault-api"
+main = "src/index.ts"
+compatibility_date = "2025-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Created with: wrangler d1 create hf-vault
+# Then paste the returned database_id below, and run:
+#   wrangler d1 execute hf-vault --remote --file=./schema.sql
+[[d1_databases]]
+binding = "DB"
+database_name = "hf-vault"
+database_id = "af653bc3-aa1e-475f-9871-978ea0d01818"
+
+# Secrets (never put these here — set via `wrangler secret put <NAME>`):
+#   ACCESS_TOKEN   shared secret gating every /api/* route (separate from
+#                  the vault master password — treat it like a root credential)

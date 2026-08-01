@@ -1,6 +1,7 @@
 # Dev files
 .env
 node_modules/
+.wrangler/
 
 # Build files
 build/

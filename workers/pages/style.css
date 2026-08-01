@@ -1,0 +1,85 @@
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0f1115;
+    color: #e7e9ee;
+}
+#app { max-width: 860px; margin: 0 auto; padding: 24px 16px; }
+
+.card {
+    background: #171a21;
+    border: 1px solid #262b36;
+    border-radius: 10px;
+    padding: 24px;
+    max-width: 420px;
+    margin: 60px auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.card h1 { margin: 0 0 8px; font-size: 1.3rem; }
+
+input, select {
+    background: #0f1115;
+    border: 1px solid #2c3242;
+    color: #e7e9ee;
+    padding: 9px 10px;
+    border-radius: 6px;
+    font-size: 0.95rem;
+}
+
+button {
+    background: #262b36;
+    color: #e7e9ee;
+    border: 1px solid #333a4a;
+    border-radius: 6px;
+    padding: 8px 14px;
+    cursor: pointer;
+    font-size: 0.9rem;
+}
+button:hover { background: #2f3543; }
+button.primary { background: #3b6dd8; border-color: #3b6dd8; }
+button.primary:hover { background: #4778e0; }
+button.small { padding: 4px 10px; font-size: 0.8rem; }
+
+.muted { color: #8a90a2; font-size: 0.9rem; }
+.error { color: #ef6c6c; font-size: 0.9rem; }
+.hidden { display: none; }
+
+.toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+.spacer { flex: 1; }
+.breadcrumb a { color: #7fa4f0; text-decoration: none; }
+.breadcrumb a:hover { text-decoration: underline; }
+
+.dropzone {
+    border: 2px dashed #333a4a;
+    border-radius: 8px;
+    padding: 24px;
+    text-align: center;
+    color: #8a90a2;
+    margin-bottom: 12px;
+}
+.dropzone.drag { border-color: #3b6dd8; color: #e7e9ee; }
+.filelabel { color: #7fa4f0; cursor: pointer; }
+
+.actions { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+
+.list { display: flex; flex-direction: column; gap: 4px; }
+.row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    background: #171a21;
+    border: 1px solid #21252f;
+}
+.row.folder a { color: #e7e9ee; text-decoration: none; font-weight: 500; }
+.row.folder a:hover { color: #7fa4f0; }
+.fname { flex: 1; }
+.fmeta { color: #8a90a2; font-size: 0.8rem; }
+
+h2 { font-size: 1.05rem; margin: 18px 0 6px; }
+h3 { font-size: 0.9rem; margin: 14px 0 4px; color: #8a90a2; }

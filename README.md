@@ -103,6 +103,9 @@ your file ──> AES-256-GCM encrypt ──> RAID split/mirror ──> one blob
 - **Upload a video (HLS)** / **Download a video (HLS)** — see *HLS video
   details* below
 - **Web UI** for bulk upload/download from a browser — see *Web UI* below
+- Optional **Cloudflare Workers/Pages deployment** for internet-reachable
+  access with client-side (WebCrypto) encryption — see *Cloudflare
+  Workers/Pages deployment* below
 - Master password change (re-encrypts the vault)
 - First-run guided setup
 
@@ -129,6 +132,68 @@ already-open CLI session shares that session's unlocked vault; started
 standalone (`hfv web`), it starts locked and unlocks the same way the CLI
 does (master password — first run creates the vault, same as the CLI's
 first-run flow).
+
+## Cloudflare Workers/Pages deployment (internet-reachable)
+
+The loopback web UI above is for "another process on the same machine."
+`workers/` is a separate, optional deployment for actually reaching your
+vault from anywhere: a Cloudflare Worker API (`workers/api`) backed by
+D1, and a static Cloudflare Pages frontend (`workers/pages`). It's a
+different trust model, not just a different host — worth reading in full
+before you deploy it.
+
+**The key design constraint: the Worker never sees a plaintext byte or an
+AES key.** All encryption/decryption (file content, the vault, and the
+per-file manifest) happens in the browser via WebCrypto. The Worker's job
+is everything that *does* need a server: holding Hugging Face account
+tokens, RAID-splitting/joining ciphertext across them, and storing file
+metadata in D1. This mirrors the local CLI's own trust model (only you,
+holding the master password, can ever decrypt anything) even though the
+API itself is now reachable over the internet rather than 127.0.0.1.
+
+Two independent secrets gate this deployment:
+- **`ACCESS_TOKEN`** — a Worker secret required as `Authorization: Bearer
+  <token>` on every `/api/*` route. Without it, the API doesn't respond
+  at all — not even to identify that a vault exists. Treat it like a root
+  credential; it also gates the account-management and RAID-mode admin
+  endpoints (`/api/admin/*`), since there's no CLI to do that from once
+  you're on Workers.
+- **Master password** — same as the CLI/local web UI, except this vault
+  lives in D1 as an encrypted blob (`GET`/`PUT /api/vault`) instead of a
+  local `.hfkey` file. **It is not the same vault** — the local `.hfkey`
+  derives its password key via scrypt; the browser derives it via
+  WebCrypto PBKDF2 (210,000 rounds, SHA-256) since WebCrypto has no
+  native scrypt. Files uploaded through Workers/Pages and files uploaded
+  through the CLI are both just Hugging Face blobs, so either app can
+  eventually see either file's metadata — but each vault only holds the
+  keys for files *it* encrypted.
+
+Scope: same bulk-oriented feature set as the local web UI (browse
+folders, upload, bulk `.zip` download, delete, move), plus a lightweight
+in-browser Settings panel for accounts and RAID mode (there's no
+`wrangler`-free way to manage those otherwise). HLS video stays
+CLI-only — nothing here changes that.
+
+### Deploying
+
+```bash
+cd workers/api
+npm install
+npx wrangler login                              # your Cloudflare account, not this app's vault
+npx wrangler d1 create hf-vault                  # copy the returned database_id into wrangler.toml
+npm run db:init                                  # applies schema.sql to the remote D1 database
+npx wrangler secret put ACCESS_TOKEN             # pick a long random value
+npm run deploy                                   # prints the Worker's https://*.workers.dev URL
+
+cd ../pages
+npx wrangler pages deploy . --project-name=hf-vault
+```
+
+Then open the Pages URL, enter the Worker URL + `ACCESS_TOKEN` (stored in
+`localStorage`), and create the vault with a master password on first
+use — same first-run flow as the CLI/local web UI. Add at least one
+Hugging Face account from the in-browser Settings panel before
+uploading.
 
 ## HLS video details
 
