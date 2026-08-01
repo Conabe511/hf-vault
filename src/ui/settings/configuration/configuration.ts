@@ -7,8 +7,11 @@ function maskToken(token: string): string {
     return token.length > 8 ? `${token.slice(0, 3)}...${token.slice(-4)}` : "***";
 }
 
-// HF-VAULT stores files in dataset repos only: datasets/[user]/[name]
-const DATASET_REPO_PATTERN = /^datasets\/[^/\s]+\/[^/\s]+$/;
+// HF-VAULT stores files in bucket repos: buckets/[user]/[name] (mutable,
+// unversioned object storage — a better fit than dataset repos, which are
+// git-backed and rack up a commit per upload/delete). Dataset repos are
+// still accepted here for anyone with an existing datasets/... vault.
+const BUCKET_REPO_PATTERN = /^(buckets|datasets)\/[^/\s]+\/[^/\s]+$/;
 
 /**
  * View/edit the runtime configuration stored in .hfconf. Also serves as
@@ -57,12 +60,12 @@ export async function configurationPage(firstRun = false) {
     }
 
     const repo = await text({
-        message: "Dataset repository (datasets/[user]/[name]):",
+        message: "Bucket (buckets/[user]/[name]):",
         initialValue: current.repo ?? "",
         validate: value =>
-            value && DATASET_REPO_PATTERN.test(value)
+            value && BUCKET_REPO_PATTERN.test(value)
                 ? undefined
-                : 'Must match datasets/[user]/[name], e.g. "datasets/FrankyMaca/my-vault"',
+                : 'Must match buckets/[user]/[name], e.g. "buckets/FrankyMaca/my-vault"',
     });
 
     if (isCancel(repo)) {

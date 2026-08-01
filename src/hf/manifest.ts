@@ -1,4 +1,4 @@
-import { commitIter, deleteFile, listFiles } from "@huggingface/hub";
+import { commitIter, deleteFile, downloadFile, listFiles } from "@huggingface/hub";
 import { HFAccount } from "./accounts";
 import { HFFileEntry, HFShard } from "./actions";
 import { RaidMode } from "../raid/types";
@@ -81,16 +81,19 @@ export async function deleteManifest(account: HFAccount, fileId: string): Promis
 
 /** Fetches and parses a manifest from one account's repo. Null if missing/unreachable/malformed. */
 export async function fetchManifest(account: HFAccount, fileId: string): Promise<HFManifest | null> {
-    const url = `https://huggingface.co/${account.repo}/resolve/main/${manifestPathFor(fileId)}`;
-
     try {
-        const response = await fetch(url, {
-            headers: { Authorization: `Bearer ${account.token}` },
+        // downloadFile (rather than a hand-built URL) resolves correctly for
+        // both bucket and dataset repos — buckets have no "resolve/main/..."
+        // revision segment, unlike git-backed dataset repos.
+        const blob = await downloadFile({
+            repo: account.repo,
+            path: manifestPathFor(fileId),
+            accessToken: account.token,
         });
 
-        if (!response.ok) return null;
+        if (!blob) return null;
 
-        return JSON.parse(await response.text()) as HFManifest;
+        return JSON.parse(await blob.text()) as HFManifest;
     }
     catch (e) {
         return null;

@@ -1,4 +1,4 @@
-import { listFiles } from "@huggingface/hub";
+import { fileDownloadInfo, listFiles } from "@huggingface/hub";
 import { HFAccount } from "./accounts";
 
 export interface RemoteFile {
@@ -90,9 +90,16 @@ function shannonEntropy(buf: Buffer): number {
  * content -> plain; otherwise high entropy -> encrypted.
  */
 export async function classifyRemoteFile(account: HFAccount, path: string): Promise<RemoteContentKind> {
-    const url = `https://huggingface.co/${account.repo}/resolve/main/${path}`;
+    // Resolving through the library (rather than hand-building a
+    // ".../resolve/main/..." URL) matters because bucket repos have no
+    // revision/branch — their download URLs look different from dataset
+    // repos, and fileDownloadInfo knows how to build the right one for either.
+    const info = await fileDownloadInfo({ repo: account.repo, path, accessToken: account.token });
+    if (!info) {
+        return { kind: "unknown" };
+    }
 
-    const response = await fetch(url, {
+    const response = await fetch(info.url, {
         headers: {
             Authorization: `Bearer ${account.token}`,
             Range: "bytes=0-4095",

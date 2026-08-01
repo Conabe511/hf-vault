@@ -4,7 +4,10 @@ import color from "picocolors";
 import { readExtraAccounts, saveExtraAccounts } from "../../../utils/hfconf";
 import { clearScreen, pressEnterToContinue } from "../../utils/screen";
 
-const DATASET_REPO_PATTERN = /^datasets\/[^/\s]+\/[^/\s]+$/;
+// Buckets (buckets/[user]/[name]) are the recommended storage type; dataset
+// repos are still accepted for anyone pointing an extra account at an
+// existing datasets/... vault.
+const BUCKET_REPO_PATTERN = /^(buckets|datasets)\/[^/\s]+\/[^/\s]+$/;
 
 function maskToken(token: string): string {
     return token.length > 8 ? `${token.slice(0, 3)}...${token.slice(-4)}` : "***";
@@ -67,8 +70,8 @@ async function addAccount() {
     if (isCancel(token)) return;
 
     const repo = await text({
-        message: "Dataset repository (datasets/[user]/[name]):",
-        validate: v => (v && DATASET_REPO_PATTERN.test(v) ? undefined : 'Must match datasets/[user]/[name], e.g. "datasets/FrankyMaca/my-vault-2"'),
+        message: "Bucket (buckets/[user]/[name]):",
+        validate: v => (v && BUCKET_REPO_PATTERN.test(v) ? undefined : 'Must match buckets/[user]/[name], e.g. "buckets/FrankyMaca/my-vault-2"'),
     });
     if (isCancel(repo)) return;
 

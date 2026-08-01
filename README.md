@@ -3,12 +3,18 @@
 Turn a Hugging Face repository into your personal encrypted cloud storage.
 
 HF-VAULT is a terminal app that encrypts your files locally with AES-256
-and uploads them to one or more Hugging Face repos — optionally spread
-across **multiple accounts** with a **RAID0/RAID1/RAID6** layout to pool
-storage or add fault tolerance. What lands on the remote is
+and uploads them to one or more Hugging Face [Storage
+Buckets](https://huggingface.co/docs/hub/storage-buckets) — optionally
+spread across **multiple accounts** with a **RAID0/RAID1/RAID6** layout to
+pool storage or add fault tolerance. What lands on the remote is
 indistinguishable from random noise: random hex names, no extensions, no
 readable content. Only your machine — holding the keys and a master
 password — can turn it back into files.
+
+Buckets are created **public** on purpose: content is opaque
+AES-256-GCM ciphertext under random blob names, so nothing readable is
+ever exposed, and public buckets get a far larger free quota (8.8TB) than
+private ones (100GB) — hence the `HF_STORAGE_TOTAL_TB` default below.
 
 ## How it works
 
@@ -73,10 +79,10 @@ yarn start
 
 ```bash
 HF_TOKEN="hf_..."                        # needs read+write repo access
-HF_REPO="datasets/you/your-vault-repo"
+HF_REPO="buckets/you/your-vault-bucket"
 APP_KEY_FILE=".hfkey"                    # optional, vault file name
-HF_STORAGE_TOTAL_TB="8.8"                # optional, quota shown in the file list
-HF_ACCOUNTS='[{"label":"acct2","token":"hf_...","repo":"datasets/you/vault-2"}]'  # optional, extra accounts
+HF_STORAGE_TOTAL_TB="8.8"                # optional, quota shown in the file list (public bucket default)
+HF_ACCOUNTS='[{"label":"acct2","token":"hf_...","repo":"buckets/you/vault-2"}]'  # optional, extra accounts
 RAID_MODE="none"                         # optional: none | raid0 | raid1 | raid6
 ```
 

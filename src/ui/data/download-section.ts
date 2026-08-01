@@ -1,4 +1,5 @@
 import { cancel, intro, isCancel, log, progress, select, spinner, text } from "@clack/prompts";
+import { fileDownloadInfo } from "@huggingface/hub";
 import { unlinkSync, writeFileSync } from "fs";
 import { Encoder } from "../../cryptography/encoder";
 import { HFDataManager, HFFileEntry, HFShard } from "../../hf/actions";
@@ -181,11 +182,25 @@ async function fetchAndReconstruct(entry: HFFileEntry): Promise<Buffer | null> {
 
 /** Downloads one shard with a progress bar; returns null (after logging) on any failure. */
 async function downloadShard(account: HFAccount, path: string, label: string): Promise<Buffer | null> {
-    const hfUrl = `https://huggingface.co/${account.repo}/resolve/main/${path}`;
+    // fileDownloadInfo resolves the correct URL for either repo type —
+    // bucket repos have no "resolve/main/..." revision segment, unlike
+    // git-backed dataset repos, so a hand-built URL only works for one of them.
+    let info: Awaited<ReturnType<typeof fileDownloadInfo>>;
+    try {
+        info = await fileDownloadInfo({ repo: account.repo, path, accessToken: account.token });
+    } catch (e) {
+        log.warn(`${label}: ${account.label} is unreachable.`);
+        return null;
+    }
+
+    if (!info) {
+        log.warn(`${label}: not found on ${account.label}.`);
+        return null;
+    }
 
     let response: Response;
     try {
-        response = await fetch(hfUrl, {
+        response = await fetch(info.url, {
             headers: { Authorization: `Bearer ${account.token}` }
         });
     } catch (e) {
@@ -198,7 +213,7 @@ async function downloadShard(account: HFAccount, path: string, label: string): P
         return null;
     }
 
-    const knownTotal = parseInt(response.headers.get("content-length") ?? "0", 10) || 0;
+    const knownTotal = info.size || parseInt(response.headers.get("content-length") ?? "0", 10) || 0;
     const dlProgress = progress({ max: 100 });
     dlProgress.start(`Downloading ${label}...`);
 

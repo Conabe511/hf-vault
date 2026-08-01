@@ -20,6 +20,9 @@ export async function createHFRepo(name: string, token: string) {
         await createRepo({
             accessToken: token,
             repo: name,
+            // Public buckets get the much larger free quota (8.8TB vs 100GB
+            // private) — safe here since content is opaque ciphertext with
+            // random blob names; nothing readable is ever exposed.
             visibility: "public",
         })
     }
@@ -53,12 +56,12 @@ export async function uploadFileToHF(file: File, to: string, token: string) {
     }
 }
 
-const HF_REPO_TYPE_PREFIXES = ["spaces", "datasets", "models"];
+const HF_REPO_TYPE_PREFIXES = ["spaces", "datasets", "models", "buckets"];
 
 export function isHFNameValid(name: string): boolean {
     const parts = name.split('/');
     // valid: "user/repo" (2 parts, implicit model repo)
-    // or "spaces|datasets|models/user/repo" (3 parts, explicit repo type)
+    // or "spaces|datasets|models|buckets/user/repo" (3 parts, explicit repo type)
     if (parts.length === 2) return true;
     if (parts.length === 3 && HF_REPO_TYPE_PREFIXES.includes(parts[0])) return true;
     return false;
