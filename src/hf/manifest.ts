@@ -1,4 +1,7 @@
 import { commitIter, deleteFile, downloadFile, listFiles } from "@huggingface/hub";
+import { randomBytes } from "crypto";
+import { unlinkSync, writeFileSync } from "fs";
+import { pathToFileURL } from "url";
 import { HFAccount } from "./accounts";
 import { HFFileEntry, HFShard } from "./actions";
 import { RaidMode } from "../raid/types";
@@ -49,19 +52,28 @@ export function buildManifest(entry: Pick<HFFileEntry, "id" | "raid" | "cipherLe
 
 /** Uploads the manifest to one account's repo, alongside that account's shard(s). */
 export async function uploadManifest(account: HFAccount, manifest: HFManifest) {
-    const content = new Blob([JSON.stringify(manifest) as unknown as BlobPart]);
+    // Written to a real temp file and referenced by URL rather than handed
+    // over as an in-memory Blob — see the matching note in upload-section.ts:
+    // an in-memory Blob was observed to produce a corrupted xorb on
+    // Hugging Face's Xet storage (mandatory for buckets).
+    const tempPath = randomBytes(16).toString("hex");
+    writeFileSync(tempPath, JSON.stringify(manifest));
 
-    for await (const _event of commitIter({
-        repo: account.repo,
-        accessToken: account.token,
-        title: `Upload manifest ${manifestPathFor(manifest.id)}`,
-        operations: [{
-            operation: "addOrUpdate",
-            path: manifestPathFor(manifest.id),
-            content,
-        }],
-    })) {
-        // manifests are a few hundred bytes — no progress reporting needed
+    try {
+        for await (const _event of commitIter({
+            repo: account.repo,
+            accessToken: account.token,
+            title: `Upload manifest ${manifestPathFor(manifest.id)}`,
+            operations: [{
+                operation: "addOrUpdate",
+                path: manifestPathFor(manifest.id),
+                content: pathToFileURL(tempPath),
+            }],
+        })) {
+            // manifests are a few hundred bytes — no progress reporting needed
+        }
+    } finally {
+        unlinkSync(tempPath);
     }
 }
 

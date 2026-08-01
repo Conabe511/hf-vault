@@ -1,7 +1,8 @@
 import { intro, isCancel, cancel, note, spinner, path, log, confirm, progress } from "@clack/prompts"
 import { commitIter, deleteFile, repoExists } from "@huggingface/hub"
 import { randomBytes } from "crypto"
-import { readFileSync, statSync, unlinkSync } from "fs"
+import { readFileSync, unlinkSync, writeFileSync } from "fs"
+import { pathToFileURL } from "url"
 import { inspectFile, createHFRepo, HFDataManager, HFShard } from "../../hf/actions"
 import { resolveAccounts } from "../../hf/accounts"
 import { buildManifest, uploadManifest } from "../../hf/manifest"
@@ -122,29 +123,42 @@ export async function handleUploadProcess() {
             const weight = (buf.length / totalBytes) * 100;
             const label = `${assignment.role} shard ${i + 1}/${shardEntries.length} (${assignment.account.label})`;
 
-            for await (const event of commitIter({
-                repo: assignment.account.repo,
-                accessToken: assignment.account.token,
-                title: `Upload ${blobPath}`,
-                fetch: progressFetch as typeof fetch,
-                operations: [{
-                    operation: "addOrUpdate",
-                    path: blobPath,
-                    content: new Blob([buf as unknown as BlobPart]),
-                }],
-            })) {
-                if (event.event === "fileProgress" && event.state === "hashing") {
-                    advanceTo(base + event.progress * weight * 0.2, `${label}: hashing...`);
+            // Content is written to a real temp file and referenced by URL
+            // (rather than handed over as an in-memory Blob) to go through
+            // the same, well-tested upload path the app always used for its
+            // single-file uploads — a raw in-memory Blob was observed to
+            // produce a corrupted xorb server-side on Hugging Face's Xet
+            // storage (buckets require Xet; it can't be turned off for them).
+            const shardTempPath = randomBytes(16).toString("hex");
+            writeFileSync(shardTempPath, buf);
+
+            try {
+                for await (const event of commitIter({
+                    repo: assignment.account.repo,
+                    accessToken: assignment.account.token,
+                    title: `Upload ${blobPath}`,
+                    fetch: progressFetch as typeof fetch,
+                    operations: [{
+                        operation: "addOrUpdate",
+                        path: blobPath,
+                        content: pathToFileURL(shardTempPath),
+                    }],
+                })) {
+                    if (event.event === "fileProgress" && event.state === "hashing") {
+                        advanceTo(base + event.progress * weight * 0.2, `${label}: hashing...`);
+                    }
+                    else if (event.event === "fileProgress" && event.state === "uploading") {
+                        advanceTo(
+                            base + weight * (0.2 + event.progress * 0.79),
+                            `${label}: uploading... ${formatBytes(event.progress * buf.length)} / ${formatBytes(buf.length)}`
+                        );
+                    }
+                    else if (event.event === "phase" && event.phase === "committing") {
+                        advanceTo(base + weight * 0.99, `${label}: finalizing commit...`);
+                    }
                 }
-                else if (event.event === "fileProgress" && event.state === "uploading") {
-                    advanceTo(
-                        base + weight * (0.2 + event.progress * 0.79),
-                        `${label}: uploading... ${formatBytes(event.progress * buf.length)} / ${formatBytes(buf.length)}`
-                    );
-                }
-                else if (event.event === "phase" && event.phase === "committing") {
-                    advanceTo(base + weight * 0.99, `${label}: finalizing commit...`);
-                }
+            } finally {
+                unlinkSync(shardTempPath);
             }
 
             uploaded.push({ assignment, path: blobPath });
