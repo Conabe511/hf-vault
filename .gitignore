@@ -11,6 +11,10 @@ build/
 
 # Secret files
 *.hfcoll
+*.hfcoll.db
+*.hfcoll.db-shm
+*.hfcoll.db-wal
+*.hfcoll.json.bak
 *.hfkey
 *.hfconf
 

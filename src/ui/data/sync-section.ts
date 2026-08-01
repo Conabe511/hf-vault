@@ -4,13 +4,20 @@ import { randomBytes } from "crypto";
 import color from "picocolors";
 import { KeyVault } from "../../cryptography/key-vault";
 import { HFDataManager } from "../../hf/actions";
+import { HFAccount, resolveAccounts } from "../../hf/accounts";
+import {
+    HFManifest,
+    fetchManifest,
+    fileIdFromManifestPath,
+    isManifestPath,
+} from "../../hf/manifest";
 import { classifyRemoteFile, fetchRemoteFiles, RemoteFile } from "../../hf/sync";
+import { findRepairCandidates, repairEntry, RepairCandidate } from "../../raid/repair";
+import { findRebalanceCandidates, rebalanceEntry, RebalanceCandidate } from "../../raid/rebalance";
+import { entryStatus, RemoteIndex } from "../../raid/status";
 import { formatBytes, logHFError } from "../../utils/utils";
 import { clearScreen } from "../utils/screen";
 import { ensureVaultOpen } from "../utils/vault-access";
-
-// HF boilerplate that exists in every repo — not user data, never reported
-const HOUSEKEEPING_FILES = new Set([".gitattributes", "README.md"]);
 
 export async function handleSyncProcess() {
     clearScreen();
@@ -18,66 +25,125 @@ export async function handleSyncProcess() {
 
     const manager = HFDataManager.getInstance();
     const tracked = manager.getFiles();
+    const accounts = resolveAccounts();
 
-    // Repos to inspect: everything referenced by local metadata,
-    // plus the currently configured one (it may hold foreign files
-    // even before the first vault upload)
-    const repos = new Set(tracked.map(f => f.repository));
-    if (process.env.HF_REPO) {
-        repos.add(process.env.HF_REPO);
-    }
-
-    if (repos.size === 0) {
-        log.warn("Nothing to synchronize: no tracked files and no HF_REPO configured.");
+    if (accounts.length === 0) {
+        log.warn("No Hugging Face account is configured yet — set one up in Settings -> Configuration.");
         return;
     }
 
     const listSpinner = spinner();
-    listSpinner.start("Listing remote repositories...");
+    listSpinner.start("Listing remote accounts...");
 
     const remote = new Map<string, RemoteFile[] | null>();
-    for (const repo of repos) {
-        remote.set(repo, await fetchRemoteFiles(repo));
+    for (const account of accounts) {
+        remote.set(account.id, await fetchRemoteFiles(account));
     }
 
     listSpinner.stop("Remote listing done");
 
-    for (const [repo, files] of remote) {
-        if (files === null) {
-            log.warn(`Could not reach ${repo} — skipping it (its entries are left untouched).`);
+    for (const account of accounts) {
+        if (remote.get(account.id) === null) {
+            log.warn(`Could not reach ${account.label} (${account.repo}) — skipping it (its entries are left untouched).`);
         }
     }
 
-    // 1. Stale entries: tracked locally, but the remote file was deleted.
-    //    Only counted when the repo WAS reachable — an unreachable repo
-    //    proves nothing about the files inside it.
-    const stale = tracked.filter(entry => {
-        const files = remote.get(entry.repository);
-        return files !== null && files !== undefined && !files.some(f => f.path === entry.path);
-    });
+    const remoteIndex: RemoteIndex = new Map();
+    for (const account of accounts) {
+        const files = remote.get(account.id);
+        remoteIndex.set(account.id, files == null ? "unreachable" : new Set(files.map(f => f.path)));
+    }
 
-    // 2. Foreign files: on the remote, but unknown to local metadata
-    const trackedPaths = new Set(tracked.map(f => `${f.repository}/${f.path}`));
-    const foreign: { repo: string; file: RemoteFile }[] = [];
+    // 1. Stale entries: tracked locally, but confirmed unrecoverable — every
+    //    shard that could cover for the missing one(s) is also gone.
+    const stale = tracked.filter(entry => entryStatus(remoteIndex, entry) === "lost");
 
-    for (const [repo, files] of remote) {
-        for (const file of files ?? []) {
-            if (HOUSEKEEPING_FILES.has(file.path)) continue;
-            if (!trackedPaths.has(`${repo}/${file.path}`)) {
-                foreign.push({ repo, file });
+    // 1b. Degraded entries: RAID1/RAID6 files missing a shard (e.g. an
+    //     account was removed/replaced) but still fully recoverable right
+    //     now via a surviving mirror or parity — worth repairing before a
+    //     second loss pushes them past what the RAID mode can cover.
+    const repairable = findRepairCandidates(tracked, remoteIndex);
+
+    // 1c. Rebalanceable entries: fully healthy RAID0/RAID1/RAID6 files
+    //     that could now be spread across more accounts than they
+    //     currently are (accounts added since upload) — "grow the array"
+    //     onto the new account(s), same RAID mode, wider split.
+    const rebalanceable = findRebalanceCandidates(tracked, accounts, remoteIndex);
+
+    // 2. Manifest blobs found on the remote, indexed by fileId -> where to
+    //    fetch one from. This is just filename matching (fileId is opaque
+    //    hex, same as any other blob name) — no decryption yet.
+    const manifestLocations = new Map<string, HFAccount[]>();
+    for (const account of accounts) {
+        const files = remote.get(account.id);
+        if (!files) continue;
+
+        for (const file of files) {
+            if (!isManifestPath(file.path)) continue;
+            const fileId = fileIdFromManifestPath(file.path);
+            const locations = manifestLocations.get(fileId) ?? [];
+            locations.push(account);
+            manifestLocations.set(fileId, locations);
+        }
+    }
+
+    // Only fileIds NOT already tracked locally are worth decrypting — for
+    // tracked entries .hfcoll already has their shard layout. Manifests
+    // are encrypted with each file's own AES key, so reading one now
+    // needs the vault open, same as decrypting the file itself would.
+    const untrackedManifestIds = [...manifestLocations.keys()].filter(id => !tracked.some(t => t.id === id));
+
+    const rebuildable: HFManifest[] = [];
+
+    if (untrackedManifestIds.length > 0) {
+        if (!await ensureVaultOpen()) {
+            log.info(`${untrackedManifestIds.length} untracked remote manifest(s) found, but the vault is locked — unlock it (run Sync again) to inspect/rebuild them.`);
+        }
+        else {
+            for (const fileId of untrackedManifestIds) {
+                for (const account of manifestLocations.get(fileId)!) {
+                    const manifest = await fetchManifest(account, fileId);
+                    if (manifest) {
+                        rebuildable.push(manifest);
+                        break;
+                    }
+                }
             }
         }
     }
 
+    // 3. Foreign files: on the remote, not a manifest, not a shard of any
+    //    tracked entry, and not referenced by ANY manifest (tracked or not)
+    //    — i.e. genuinely unrelated to how HF-VAULT stores things.
+    const trackedPaths = new Set(
+        tracked.flatMap(entry => entry.shards.map(s => `${s.accountId}:${s.path}`))
+    );
+    const manifestReferencedPaths = new Set(
+        rebuildable.flatMap(m => m.shards.map(s => `${s.accountId}:${s.path}`))
+    );
+
+    const foreign: { account: HFAccount; file: RemoteFile }[] = [];
+    for (const account of accounts) {
+        const files = remote.get(account.id);
+        if (!files) continue;
+
+        for (const file of files) {
+            if (isManifestPath(file.path)) continue;
+            const key = `${account.id}:${file.path}`;
+            if (trackedPaths.has(key) || manifestReferencedPaths.has(key)) continue;
+            foreign.push({ account, file });
+        }
+    }
+
     // Peek at each foreign file's content to guess whether it's encrypted
-    const classified: { repo: string; file: RemoteFile; label: string }[] = [];
+    const classified: { account: HFAccount; file: RemoteFile; label: string }[] = [];
 
     if (foreign.length > 0) {
         const classifySpinner = spinner();
         classifySpinner.start(`Inspecting ${foreign.length} unknown remote file(s)...`);
 
         for (const item of foreign) {
-            const content = await classifyRemoteFile(item.repo, item.file.path);
+            const content = await classifyRemoteFile(item.account, item.file.path);
 
             const label =
                 content.kind === "plain" ? color.yellow(`not encrypted (${content.format})`) :
@@ -90,39 +156,42 @@ export async function handleSyncProcess() {
         classifySpinner.stop("Content inspection done");
     }
 
-    const synced = tracked.length - stale.length;
+    const synced = tracked.length - stale.length - repairable.length - rebalanceable.length;
 
     note(
         `${color.green("●")} In sync:        ${synced} file(s)\n` +
-        `${color.red("●")} Stale locally:  ${stale.length} file(s) (deleted on remote)\n` +
-        `${color.yellow("●")} Foreign remote: ${classified.length} file(s) (not in your vault)`,
+        `${color.yellow("●")} Degraded:       ${repairable.length} file(s) (recoverable now, but missing a shard)\n` +
+        `${color.red("●")} Lost:           ${stale.length} file(s) (unrecoverable on remote)\n` +
+        `${color.cyan("●")} Rebalanceable:  ${rebalanceable.length} file(s) (could use recently added account(s))\n` +
+        `${color.cyan("●")} Rebuildable:    ${rebuildable.length} file(s) (remote manifest, no local record)\n` +
+        `${color.yellow("●")} Foreign remote: ${classified.length} file(s) (not part of your vault)`,
         "Sync Summary"
     );
 
     if (classified.length > 0) {
         note(
             classified
-                .map(c => `${c.file.path}  (${formatBytes(c.file.size)}, ${c.repo})\n  ${c.label}`)
+                .map(c => `${c.file.path}  (${formatBytes(c.file.size)}, ${c.account.label})\n  ${c.label}`)
                 .join("\n"),
             "Foreign files on remote"
         );
     }
 
     if (stale.length === 0) {
-        log.success("Local metadata matches the remote. Nothing to clean up.");
+        log.success("No tracked files are unrecoverable. Nothing to clean up.");
     }
     else {
         note(
-            stale.map(s => `${s.name}  (${formatBytes(s.size)}, was ${s.repository}/${s.path})`).join("\n"),
-            "Deleted on remote, still tracked locally"
+            stale.map(s => `${s.name}  (${formatBytes(s.size)}, ${s.raid.toUpperCase()}, ${s.shards.length} shard(s))`).join("\n"),
+            "Lost — tracked locally, unrecoverable on remote"
         );
 
         const cleanup = await confirm({
-            message: `Remove these ${stale.length} stale entr${stale.length === 1 ? "y" : "ies"} from local metadata?`,
+            message: `Remove these ${stale.length} lost entr${stale.length === 1 ? "y" : "ies"} from local metadata?`,
         });
 
         if (isCancel(cleanup) || !cleanup) {
-            log.info("Kept the stale entries. They will show as 'missing on remote' in the file list.");
+            log.info("Kept the entries. They will keep showing as 'lost' in the file list.");
         }
         else {
             for (const entry of stale) {
@@ -130,9 +199,21 @@ export async function handleSyncProcess() {
             }
 
             // Their decryption keys stay in the vault on purpose: harmless, and
-            // still useful if the user happens to keep a copy of the encrypted blob
+            // still useful if the user happens to keep a copy of a surviving shard
             log.success(`Removed ${stale.length} entr${stale.length === 1 ? "y" : "ies"} from local metadata.`);
         }
+    }
+
+    if (repairable.length > 0) {
+        await repairDegradedFiles(repairable, accounts);
+    }
+
+    if (rebalanceable.length > 0) {
+        await rebalanceFiles(rebalanceable, accounts);
+    }
+
+    if (rebuildable.length > 0) {
+        await manageRebuildableFiles(rebuildable);
     }
 
     if (classified.length > 0) {
@@ -140,8 +221,174 @@ export async function handleSyncProcess() {
     }
 }
 
+/**
+ * Reconstructs and re-uploads each degraded file's missing shard(s),
+ * restoring full RAID redundancy. Repaired shards land back on the same
+ * account if it's still configured, or on any other configured account
+ * not already holding a shard for that file otherwise — no per-file
+ * prompting, matching how RAID mode selection already works elsewhere.
+ */
+async function repairDegradedFiles(candidates: RepairCandidate[], accounts: HFAccount[]) {
+    note(
+        candidates
+            .map(c => `${c.entry.name}  (${c.entry.raid.toUpperCase()}, missing ${c.missingShards.length} of ${c.entry.shards.length} shard(s))`)
+            .join("\n"),
+        "Degraded — recoverable now, but worth repairing"
+    );
+
+    const proceed = await confirm({
+        message: `Repair these ${candidates.length} file(s) now? Each missing shard is rebuilt from parity/mirror and re-uploaded.`,
+    });
+
+    if (isCancel(proceed) || !proceed) {
+        log.info("Skipped repair. These files stay degraded until you run Sync again.");
+        return;
+    }
+
+    // The refreshed manifest each repair writes is encrypted with the
+    // file's AES key, so the vault has to be open before repairing anything.
+    if (!await ensureVaultOpen()) {
+        log.warn("Vault stayed locked — repair needs it to re-encrypt manifests. Nothing was repaired.");
+        return;
+    }
+
+    const repairSpinner = spinner();
+    let succeeded = 0;
+
+    for (const candidate of candidates) {
+        repairSpinner.start(`Repairing "${candidate.entry.name}"...`);
+
+        const result = await repairEntry(candidate, accounts);
+
+        if (result.ok) {
+            succeeded++;
+            repairSpinner.stop(result.message);
+        }
+        else {
+            repairSpinner.stop(color.red(`Repair failed for ${result.message}`));
+        }
+    }
+
+    log.success(`Repaired ${succeeded}/${candidates.length} degraded file(s).`);
+}
+
+/**
+ * Re-plans each rebalanceable file across every currently configured
+ * account, uploads the wider shard set, then retires the old one — same
+ * RAID mode throughout, just spread over more accounts. This is a real
+ * bulk operation (every candidate gets fully re-downloaded and
+ * re-uploaded), not an instant metadata change, so it's opt-in per Sync
+ * run rather than automatic.
+ */
+async function rebalanceFiles(candidates: RebalanceCandidate[], accounts: HFAccount[]) {
+    note(
+        candidates
+            .map(c => `${c.entry.name}  (${c.entry.raid.toUpperCase()}, ${c.currentShardCount} -> ${c.desiredShardCount} shard(s))`)
+            .join("\n"),
+        "Rebalanceable — could use recently added account(s)"
+    );
+
+    const proceed = await confirm({
+        message: `Rebalance these ${candidates.length} file(s) now? Each one is fully re-downloaded and re-uploaded across the wider account set.`,
+    });
+
+    if (isCancel(proceed) || !proceed) {
+        log.info("Skipped rebalancing. These files stay on their current (narrower) layout until you run Sync again.");
+        return;
+    }
+
+    // Re-uploading writes a fresh, re-encrypted manifest, same as repair
+    if (!await ensureVaultOpen()) {
+        log.warn("Vault stayed locked — rebalancing needs it to re-encrypt manifests. Nothing was rebalanced.");
+        return;
+    }
+
+    const rebalanceSpinner = spinner();
+    let succeeded = 0;
+
+    for (const candidate of candidates) {
+        rebalanceSpinner.start(`Rebalancing "${candidate.entry.name}"...`);
+
+        const result = await rebalanceEntry(candidate.entry, accounts);
+
+        if (result.ok) {
+            succeeded++;
+            rebalanceSpinner.stop(result.message);
+        }
+        else {
+            rebalanceSpinner.stop(color.red(`Rebalance failed for ${result.message}`));
+        }
+    }
+
+    log.success(`Rebalanced ${succeeded}/${candidates.length} file(s).`);
+}
+
+/**
+ * Files the remote itself describes (via a manifest) but that have no
+ * local .hfcoll record at all — typically because .hfcoll was lost/reset.
+ * Rebuilding restores the shard topology and iv/tag from the manifest;
+ * the AES key still only comes from .hfkey (by fileId) or manual entry,
+ * same as importing a foreign file.
+ */
+async function manageRebuildableFiles(manifests: HFManifest[]) {
+    const remaining = [...manifests];
+
+    while (remaining.length > 0) {
+        const choice = await select({
+            message: "Files described by a remote manifest but untracked locally:",
+            options: [
+                ...remaining.map((m, index) => ({
+                    value: index,
+                    label: m.id,
+                    hint: `${m.raid.toUpperCase()} — ${m.shards.length} shard(s)`,
+                })),
+                { value: -1, label: color.dim("← Done") },
+            ],
+        });
+
+        if (isCancel(choice) || choice === -1) {
+            return;
+        }
+
+        const manifest = remaining[choice as number];
+
+        const action = await select({
+            message: `${manifest.id} — what do you want to do?`,
+            options: [
+                { value: "rebuild", label: "Rebuild into local vault", hint: "tracks it again; its original name is unknown" },
+                { value: "back", label: color.dim("← Back") },
+            ],
+        });
+
+        if (isCancel(action) || action === "back") {
+            continue;
+        }
+
+        HFDataManager.getInstance().addFile({
+            id: manifest.id,
+            name: `recovered-${manifest.id}`,
+            size: manifest.cipherLength,
+            mime: "application/octet-stream",
+            createdAt: new Date().toISOString(),
+            iv: manifest.iv,
+            tag: manifest.tag,
+            raid: manifest.raid,
+            cipherLength: manifest.cipherLength,
+            shards: manifest.shards,
+            folder: "",
+            raw: false,
+        });
+
+        // Its manifest only decrypted (see the caller) because the vault
+        // already had this file's AES key, so it's guaranteed downloadable now.
+        log.success(`Rebuilt "${manifest.id}" — its AES key is already in your vault, so it can be downloaded now.`);
+
+        remaining.splice(remaining.indexOf(manifest), 1);
+    }
+}
+
 interface ForeignItem {
-    repo: string;
+    account: HFAccount;
     file: RemoteFile;
     label: string;
 }
@@ -156,7 +403,7 @@ async function manageForeignFiles(items: ForeignItem[]) {
                 ...remaining.map((item, index) => ({
                     value: index,
                     label: item.file.path,
-                    hint: `${formatBytes(item.file.size)} — ${item.repo}`,
+                    hint: `${formatBytes(item.file.size)} — ${item.account.label}`,
                 })),
                 { value: -1, label: color.dim("← Done") },
             ],
@@ -182,14 +429,8 @@ async function manageForeignFiles(items: ForeignItem[]) {
         }
 
         if (action === "delete") {
-            const token = process.env.HF_TOKEN;
-            if (!token) {
-                log.error("HF_TOKEN is not configured — cannot delete remote files.");
-                continue;
-            }
-
             const sure = await confirm({
-                message: `Permanently delete ${item.file.path} from ${item.repo}?`,
+                message: `Permanently delete ${item.file.path} from ${item.account.label}?`,
             });
 
             if (isCancel(sure) || !sure) {
@@ -198,9 +439,9 @@ async function manageForeignFiles(items: ForeignItem[]) {
 
             try {
                 await deleteFile({
-                    repo: item.repo,
+                    repo: item.account.repo,
                     path: item.file.path,
-                    accessToken: token,
+                    accessToken: item.account.token,
                 });
                 remaining.splice(remaining.indexOf(item), 1);
                 log.success(`Deleted ${item.file.path} from the remote.`);
@@ -218,13 +459,13 @@ async function manageForeignFiles(items: ForeignItem[]) {
 }
 
 /**
- * Tracks a foreign remote file in local metadata. Its real name, type and
- * creation date are unknowable (that information never left the machine
- * that uploaded it), so the entry is mostly empty. If the user saved the
- * file's AES-256 key and IV, both go into the vault/metadata and the file
- * becomes fully downloadable + decryptable again.
+ * Tracks a foreign remote file in local metadata, as a single-shard
+ * raid:"none" entry. Its real name, type and creation date are unknowable
+ * (that information never left the machine that uploaded it). If the user
+ * saved the file's AES-256 key and IV, both go into the vault/metadata and
+ * the file becomes fully downloadable + decryptable again.
  */
-async function importForeignFile(item: ForeignItem) {
+async function importForeignFile(item: { account: HFAccount; file: RemoteFile }) {
     const fileId = randomBytes(16).toString("hex");
 
     let ivHex = "";
@@ -273,10 +514,19 @@ async function importForeignFile(item: ForeignItem) {
         size: item.file.size,
         mime: "application/octet-stream",
         createdAt: new Date().toISOString(),
-        repository: item.repo,
-        path: item.file.path,
         iv: ivHex,
         tag: "",
+        raid: "none",
+        cipherLength: item.file.size,
+        shards: [{
+            accountId: item.account.id,
+            repository: item.account.repo,
+            path: item.file.path,
+            role: "data",
+            index: 0,
+        }],
+        folder: "",
+        raw: false,
     });
 
     log.success(

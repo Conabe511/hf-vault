@@ -1,12 +1,14 @@
+import { Database } from "bun:sqlite";
 import { createRepo, repoExists, uploadFile } from "@huggingface/hub"
 import { HFVInvalidToken, HFVRepoNotFound, HFVInvalidName } from './errors'
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { existsSync, readFileSync, renameSync, statSync } from "node:fs"
 import { basename, extname } from "node:path"
 import { resolveAppFile } from "../utils/app-paths"
+import { RaidMode } from "../raid/types"
 
-export async function createHFRepo(name: string) {
+export async function createHFRepo(name: string, token: string) {
 
-    if (!process.env.HF_TOKEN) {
+    if (!token) {
         throw new HFVInvalidToken()
     }
 
@@ -16,8 +18,11 @@ export async function createHFRepo(name: string) {
 
     try {
         await createRepo({
-            accessToken: process.env.HF_TOKEN,
+            accessToken: token,
             repo: name,
+            // Public buckets get the much larger free quota (8.8TB vs 100GB
+            // private) — safe here since content is opaque ciphertext with
+            // random blob names; nothing readable is ever exposed.
             visibility: "public",
         })
     }
@@ -26,8 +31,8 @@ export async function createHFRepo(name: string) {
     }
 }
 
-export async function uploadFileToHF(file: File, to: string) {
-    if (!process.env.HF_TOKEN) {
+export async function uploadFileToHF(file: File, to: string, token: string) {
+    if (!token) {
         throw new HFVInvalidToken()
     }
 
@@ -35,13 +40,13 @@ export async function uploadFileToHF(file: File, to: string) {
         throw new HFVInvalidName()
     }
 
-    if (!await repoExists({ accessToken: process.env.HF_TOKEN, repo: to})) {
+    if (!await repoExists({ accessToken: token, repo: to})) {
         throw new HFVRepoNotFound()
     }
 
     try {
         await uploadFile({
-            accessToken: process.env.HF_TOKEN,
+            accessToken: token,
             repo: to,
             file: file
         })
@@ -51,12 +56,12 @@ export async function uploadFileToHF(file: File, to: string) {
     }
 }
 
-const HF_REPO_TYPE_PREFIXES = ["spaces", "datasets", "models"];
+const HF_REPO_TYPE_PREFIXES = ["spaces", "datasets", "models", "buckets"];
 
 export function isHFNameValid(name: string): boolean {
     const parts = name.split('/');
     // valid: "user/repo" (2 parts, implicit model repo)
-    // or "spaces|datasets|models/user/repo" (3 parts, explicit repo type)
+    // or "spaces|datasets|models|buckets/user/repo" (3 parts, explicit repo type)
     if (parts.length === 2) return true;
     if (parts.length === 3 && HF_REPO_TYPE_PREFIXES.includes(parts[0])) return true;
     return false;
@@ -75,33 +80,178 @@ export async function inspectFile(path: string) {
     };
 }
 
-interface HFFileEntry {
+export interface HFShard {
+    accountId: string;
+    repository: string;
+    path: string;
+    role: "data" | "parity-p" | "parity-q" | "mirror";
+    index: number;
+}
+
+export interface HFFileEntry {
     id: string;
     name: string;
     size: number;
     mime: string;
     createdAt: string;
 
-    repository: string;
-    path: string;
-
     iv: string;
     tag: string;
+
+    // How this file's ciphertext is laid out across accounts, and how
+    // long that ciphertext was before shard padding (needed to trim the
+    // reassembled buffer on download — irrelevant for "none", which has
+    // exactly one shard holding the whole ciphertext untouched).
+    raid: RaidMode;
+    cipherLength: number;
+    shards: HFShard[];
+
+    // Purely local/virtual organization — "" is the root, "Photos/2024"
+    // etc. otherwise. Independent of both the local filesystem path this
+    // file came from and the remote blob name (still random hex): like
+    // `name`, this stays local-only and is never written to the remote
+    // manifest, since a folder path can be just as identifying as a
+    // filename (e.g. "Taxes/Divorce documents").
+    folder: string;
+
+    // When true, upload/download use the shard bytes exactly as given —
+    // no AES-256-GCM pass, no key registered in the vault under this
+    // fileId. For content that arrives pre-encrypted under its own,
+    // separate key (currently: HLS video segments, AES-128-CBC via
+    // ffmpeg) and must stay byte-identical on the wire — running it
+    // through this app's own cipher on top would just be a second,
+    // pointless encryption layer with no benefit and would break e.g.
+    // HLS players expecting the segment bytes to decrypt directly under
+    // their own key. iv/tag are unused (empty) for raw entries.
+    raw: boolean;
 }
 
-interface HFCollection {
+/** "", "/", "a//b/", "a\\b" -> "", "", "a/b", "a/b" — the on-disk/DB canonical form. */
+export function normalizeFolder(path: string): string {
+    return path
+        .replace(/\\/g, "/")
+        .split("/")
+        .map(segment => segment.trim())
+        .filter(segment => segment.length > 0)
+        .join("/");
+}
+
+// Legacy pre-RAID .hfcoll JSON shape — read once, for migration only.
+interface LegacyCollection {
     version: number;
-    files: HFFileEntry[];
+    files: {
+        id: string; name: string; size: number; mime: string; createdAt: string;
+        repository: string; path: string; iv: string; tag: string;
+    }[];
+}
+
+function ensureSchema(db: Database) {
+    db.run("PRAGMA foreign_keys = ON");
+    db.run(`
+        CREATE TABLE IF NOT EXISTS files (
+            id            TEXT PRIMARY KEY,
+            name          TEXT NOT NULL,
+            size          INTEGER NOT NULL,
+            mime          TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            iv            TEXT NOT NULL,
+            tag           TEXT NOT NULL,
+            raid          TEXT NOT NULL,
+            cipher_length INTEGER NOT NULL,
+            folder        TEXT NOT NULL DEFAULT '',
+            raw           INTEGER NOT NULL DEFAULT 0
+        )
+    `);
+    db.run(`
+        CREATE TABLE IF NOT EXISTS shards (
+            file_id     TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+            account_id  TEXT NOT NULL,
+            repository  TEXT NOT NULL,
+            path        TEXT NOT NULL,
+            role        TEXT NOT NULL,
+            shard_index INTEGER NOT NULL,
+            PRIMARY KEY (file_id, account_id, path)
+        )
+    `);
+
+    // `folder`/`raw` were added after the initial schema — existing
+    // .hfcoll.db files won't have them yet. CREATE TABLE IF NOT EXISTS is
+    // a no-op on those, so the columns have to be added out-of-band.
+    const columns = db.query("PRAGMA table_info(files)").all() as { name: string }[];
+    if (!columns.some(c => c.name === "folder")) {
+        db.run("ALTER TABLE files ADD COLUMN folder TEXT NOT NULL DEFAULT ''");
+    }
+    if (!columns.some(c => c.name === "raw")) {
+        db.run("ALTER TABLE files ADD COLUMN raw INTEGER NOT NULL DEFAULT 0");
+    }
+}
+
+/**
+ * One-time upgrade path from the old flat-JSON .hfcoll to the SQLite
+ * .hfcoll.db. Only runs when a .hfcoll.db doesn't exist yet but a legacy
+ * .hfcoll does; every old entry becomes a single-shard raid:"none" file.
+ * The old file is kept (renamed, not deleted) as a safety net.
+ */
+function migrateLegacyCollection(dbPath: string) {
+    if (existsSync(dbPath)) return;
+
+    const legacyPath = resolveAppFile(".hfcoll");
+    if (!existsSync(legacyPath)) return;
+
+    let legacy: LegacyCollection;
+    try {
+        legacy = JSON.parse(readFileSync(legacyPath, "utf8"));
+    }
+    catch (e) {
+        return; // malformed legacy file — behave as if there was none
+    }
+
+    const db = new Database(dbPath, { create: true });
+    ensureSchema(db);
+
+    const insertFile = db.prepare(
+        `INSERT INTO files (id, name, size, mime, created_at, iv, tag, raid, cipher_length)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'none', 0)`
+    );
+    const insertShard = db.prepare(
+        `INSERT INTO shards (file_id, account_id, repository, path, role, shard_index)
+         VALUES (?, 'primary', ?, ?, 'data', 0)`
+    );
+
+    const migrate = db.transaction((files: LegacyCollection["files"]) => {
+        for (const f of files) {
+            insertFile.run(f.id, f.name, f.size, f.mime, f.createdAt, f.iv ?? "", f.tag ?? "");
+            insertShard.run(f.id, f.repository, f.path);
+        }
+    });
+
+    migrate(legacy.files ?? []);
+    db.close();
+
+    renameSync(legacyPath, resolveAppFile(".hfcoll.json.bak"));
+}
+
+interface FileRow {
+    id: string; name: string; size: number; mime: string; created_at: string;
+    iv: string; tag: string; raid: string; cipher_length: number; folder: string; raw: number;
+}
+
+interface ShardRow {
+    file_id: string; account_id: string; repository: string; path: string;
+    role: HFShard["role"]; shard_index: number;
 }
 
 export class HFDataManager {
     private static instance: HFDataManager;
 
-    private collectionPath: string;
-    private collection?: HFCollection;
+    private db: Database;
 
-    private constructor(path = ".hfcoll") {
-        this.collectionPath = resolveAppFile(path);
+    private constructor(path = ".hfcoll.db") {
+        const dbPath = resolveAppFile(path);
+        migrateLegacyCollection(dbPath);
+
+        this.db = new Database(dbPath, { create: true });
+        ensureSchema(this.db);
     }
 
     static getInstance(): HFDataManager {
@@ -112,49 +262,98 @@ export class HFDataManager {
         return HFDataManager.instance;
     }
 
-    private load(): HFCollection {
-        if (!this.collection) {
-            if (!existsSync(this.collectionPath)) {
-                this.collection = {
-                    version: 1,
-                    files: []
-                };
-            } else {
-                this.collection = JSON.parse(
-                    readFileSync(this.collectionPath, "utf8")
-                );
-            }
-        }
-
-        return this.collection ?? { version: 0, files: [ ]};
-    }
-
-    private save() {
-        if (!this.collection) return;
-
-        writeFileSync(
-            this.collectionPath,
-            JSON.stringify(this.collection, null, 2)
-        );
+    private toEntry(fileRow: FileRow, shardRows: ShardRow[]): HFFileEntry {
+        return {
+            id: fileRow.id,
+            name: fileRow.name,
+            size: fileRow.size,
+            mime: fileRow.mime,
+            createdAt: fileRow.created_at,
+            iv: fileRow.iv,
+            tag: fileRow.tag,
+            raid: fileRow.raid as RaidMode,
+            cipherLength: fileRow.cipher_length,
+            folder: fileRow.folder,
+            raw: fileRow.raw !== 0,
+            shards: shardRows
+                .filter(s => s.file_id === fileRow.id)
+                .sort((a, b) => a.shard_index - b.shard_index)
+                .map(s => ({
+                    accountId: s.account_id,
+                    repository: s.repository,
+                    path: s.path,
+                    role: s.role,
+                    index: s.shard_index,
+                })),
+        };
     }
 
     addFile(file: HFFileEntry) {
-        const collection = this.load();
-        collection.files.push(file);
-        this.save();
+        const insertFile = this.db.prepare(
+            `INSERT INTO files (id, name, size, mime, created_at, iv, tag, raid, cipher_length, folder, raw)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        );
+        const insertShard = this.db.prepare(
+            `INSERT INTO shards (file_id, account_id, repository, path, role, shard_index)
+             VALUES (?, ?, ?, ?, ?, ?)`
+        );
+
+        const tx = this.db.transaction((f: HFFileEntry) => {
+            insertFile.run(f.id, f.name, f.size, f.mime, f.createdAt, f.iv, f.tag, f.raid, f.cipherLength, normalizeFolder(f.folder), f.raw ? 1 : 0);
+            for (const s of f.shards) {
+                insertShard.run(f.id, s.accountId, s.repository, s.path, s.role, s.index);
+            }
+        });
+
+        tx(file);
+    }
+
+    /** Moves a file to a different virtual vault folder — purely local, no remote effect. */
+    moveFile(id: string, folder: string) {
+        this.db.run("UPDATE files SET folder = ? WHERE id = ?", [normalizeFolder(folder), id]);
+    }
+
+    /** Every distinct non-root folder path currently in use, for picker suggestions. */
+    listFolders(): string[] {
+        const rows = this.db.query("SELECT DISTINCT folder FROM files WHERE folder != '' ORDER BY folder").all() as { folder: string }[];
+        return rows.map(r => r.folder);
     }
 
     getFiles(): HFFileEntry[] {
-        return this.load().files;
+        const fileRows = this.db.query("SELECT * FROM files ORDER BY created_at DESC").all() as FileRow[];
+        const shardRows = this.db.query("SELECT * FROM shards").all() as ShardRow[];
+
+        return fileRows.map(f => this.toEntry(f, shardRows));
     }
 
-    getFile(id: string) {
-        return this.load().files.find(x => x.id === id);
+    getFile(id: string): HFFileEntry | undefined {
+        const fileRow = this.db.query("SELECT * FROM files WHERE id = ?").get(id) as FileRow | null;
+        if (!fileRow) return undefined;
+
+        const shardRows = this.db.query("SELECT * FROM shards WHERE file_id = ?").all(id) as ShardRow[];
+        return this.toEntry(fileRow, shardRows);
     }
 
     removeFile(id: string) {
-        const collection = this.load();
-        collection.files = collection.files.filter(x => x.id !== id);
-        this.save();
+        // ON DELETE CASCADE (foreign_keys pragma is on) takes the shards with it
+        this.db.run("DELETE FROM files WHERE id = ?", [id]);
+    }
+
+    /** Replaces a file's entire shard list — used by repair to swap in a freshly re-uploaded shard. */
+    setShards(id: string, shards: HFShard[]) {
+        const deleteShards = this.db.prepare(`DELETE FROM shards WHERE file_id = ?`);
+        const insertShard = this.db.prepare(
+            `INSERT INTO shards (file_id, account_id, repository, path, role, shard_index)
+             VALUES (?, ?, ?, ?, ?, ?)`
+        );
+
+        const tx = this.db.transaction((fileId: string, list: HFShard[]) => {
+            deleteShards.run(fileId);
+            for (const s of list) {
+                insertShard.run(fileId, s.accountId, s.repository, s.path, s.role, s.index);
+            }
+        });
+
+        tx(id, shards);
     }
 }
